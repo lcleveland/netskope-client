@@ -20,6 +20,9 @@
 
       nixosModules.default = import ./modules/netskope.nix;
 
+      # Module VM test (scaffold — see tests/module.nix; run under #10).
+      checks.${system}.module = import ./tests/module.nix { inherit pkgs self; };
+
       formatter.${system} = pkgs.nixfmt-rfc-style;
 
       devShells.${system}.default = pkgs.mkShell {

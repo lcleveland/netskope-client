@@ -130,8 +130,10 @@ stdenv.mkDerivation {
     inherit enableTray;
     # The client hard-codes this path; the module materialises it (see issue #7).
     installDir = "/opt/netskope/stagent";
-    # Netskope root CA shipped in the payload, for security.pki wiring (see issue #8).
-    caCertPath = "/opt/netskope/stagent/data/nscacert.pem";
+    # Where the client writes its root CA at runtime (NOT shipped in the installer;
+    # provisioned at enrollment). After #7's relocation the real file lives under
+    # /var/lib/netskope/data/. CA trust is user-supplied via the module (see #8).
+    caCertRuntimePath = "/var/lib/netskope/data/nscacert.pem";
   };
 
   meta = {

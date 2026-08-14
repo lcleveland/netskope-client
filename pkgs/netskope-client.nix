@@ -2,6 +2,7 @@
   lib,
   stdenv,
   requireFile,
+  fetchurl,
   autoPatchelfHook,
   patchelf,
   gzip,
@@ -20,22 +21,54 @@
   dbus,
   # options
   enableTray ? true,
-  # override the installer source; defaults to a requireFile of NSClient.run
-  src ? null,
+  # client source (resolution order is in the `let` block below):
+  tenant ? null, # short tenant name -> fetch from download-<tenant>.goskope.com (no auth)
+  hash ? null, # hash of the fetched NSClient.run (required with tenant/url)
+  url ? null, # explicit installer URL override (mirror); requires hash
+  src ? null, # explicit src override (path/derivation); wins over everything
 }:
 
 let
   version = "140.0.2.2763";
 
-  # The Netskope installer is proprietary and rebuilt per tenant, so it cannot be
-  # redistributed or pinned to a public hash. The user must supply NSClient.run.
-  # This sha256 is the lselectric v140 build; override `src` if yours differs.
-  defaultSrc = requireFile {
+  # Client source resolution, in priority order:
+  #   1. explicit `src`       (path/derivation)
+  #   2. `url` + `hash`       (fetchurl from a mirror)
+  #   3. `tenant` + `hash`    (fetchurl from download-<tenant>.goskope.com; public, no auth)
+  #   4. requireFile fallback (offline: `nix-store --add-fixed sha256 NSClient.run`)
+  #
+  # The download URL is public (verified: no auth), but the file is proprietary and
+  # rebuilt per tenant/version, so its hash is not universal -- the user pins `hash`
+  # and bumps it when Netskope ships a new client build.
+  downloadUrl =
+    if url != null then
+      url
+    else if tenant != null then
+      "https://download-${tenant}.goskope.com/dlr/linux/get"
+    else
+      null;
+
+  fetchedSrc =
+    if downloadUrl == null then
+      null
+    else if hash == null then
+      throw "netskope-client: set `hash` when using `tenant`/`url`. The installer's hash changes per client version; get it with:  nix store prefetch-file --name NSClient.run \"${downloadUrl}\""
+    else
+      fetchurl (
+        {
+          url = downloadUrl;
+          name = "NSClient.run";
+        }
+        // (if lib.hasInfix "-" hash then { inherit hash; } else { sha256 = hash; })
+      );
+
+  # Offline / air-gapped fallback. This sha256 is the lselectric v140 build.
+  requireFileSrc = requireFile {
     name = "NSClient.run";
     sha256 = "94e02c57eff357528d641ada0f0f2a6bb9cbe120eed061f7c21a3b7e02e14132";
     message = ''
-      The Netskope client installer (NSClient.run) is proprietary and tenant-specific;
-      it is rebuilt per tenant and cannot be redistributed. Obtain it from your tenant:
+      No client source configured. Either set `tenant` (+ `hash`) to fetch it, or
+      supply NSClient.run offline. It is proprietary and tenant-specific; obtain it:
 
         Admin console: Settings -> Tools -> Downloads -> Linux   (choose the .run)
         or:            https://download-<tenant>.goskope.com/dlr/linux/get
@@ -48,12 +81,20 @@ let
         94e02c57eff357528d641ada0f0f2a6bb9cbe120eed061f7c21a3b7e02e14132
     '';
   };
+
+  resolvedSrc =
+    if src != null then
+      src
+    else if fetchedSrc != null then
+      fetchedSrc
+    else
+      requireFileSrc;
 in
 stdenv.mkDerivation {
   pname = "netskope-client";
   inherit version;
 
-  src = if src != null then src else defaultSrc;
+  src = resolvedSrc;
 
   nativeBuildInputs = [
     autoPatchelfHook

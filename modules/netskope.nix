@@ -17,9 +17,48 @@ in
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = pkgs.callPackage ../pkgs/netskope-client.nix { inherit (cfg) enableTray; };
-      defaultText = lib.literalExpression "netskope-client";
-      description = "The netskope-client package to run.";
+      default = pkgs.callPackage ../pkgs/netskope-client.nix {
+        inherit (cfg) enableTray tenant hash;
+        url = cfg.sourceUrl;
+      };
+      defaultText = lib.literalExpression "netskope-client (built from tenant/hash/sourceUrl)";
+      description = ''
+        The netskope-client package to run. By default it is built from the
+        `tenant`/`hash`/`sourceUrl` options; override to supply a custom build
+        (e.g. `pkgs.netskope-client.override { src = ./NSClient.run; }`).
+      '';
+    };
+
+    tenant = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "lselectric";
+      description = ''
+        Short tenant name. When set, the installer is fetched (no auth) from
+        https://download-<tenant>.goskope.com/dlr/linux/get using `hash`, and
+        `tenantHost` defaults to addon-<tenant>.goskope.com. Leave null to supply
+        the installer offline (requireFile) or via a custom `package`.
+      '';
+    };
+
+    hash = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "sha256-lOAsV+/zV1KNZBraDw8qa7nL4SDu0GH3who7fgLhQTI=";
+      description = ''
+        Hash (SRI or sha256 hex) of the fetched NSClient.run. Required when `tenant`
+        or `sourceUrl` is set. It changes when Netskope pushes a new client version
+        to your tenant -- update it then (e.g. `nix store prefetch-file`).
+      '';
+    };
+
+    sourceUrl = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = ''
+        Override the installer download URL (e.g. an internal mirror). Requires
+        `hash`; takes precedence over `tenant`.
+      '';
     };
 
     enableTray = lib.mkOption {
@@ -55,13 +94,14 @@ in
 
     tenantHost = lib.mkOption {
       type = lib.types.str;
-      default = "";
+      default = if cfg.tenant == null then "" else "addon-${cfg.tenant}.goskope.com";
+      defaultText = lib.literalExpression ''"addon-<tenant>.goskope.com" when `tenant` is set, else ""'';
       example = "addon-<tenant>.goskope.com";
       description = ''
         Tenant enrollment host (the addon/gateway host). Maps to the client's
-        -H/--tenantHostname. Not a credential, but tenant-identifying -- set it in
-        your own configuration. Leave empty to package the client without
-        declarative enrollment.
+        -H/--tenantHostname. Defaults to addon-<tenant>.goskope.com when `tenant`
+        is set; override for regional variants. Leave empty to package the client
+        without declarative enrollment.
       '';
     };
 
@@ -282,6 +322,22 @@ in
         WorkingDirectory = "/opt/netskope/stagent";
         Restart = "always";
         RestartSec = 10;
+      };
+    };
+
+    # Per-user tray UI (#4). Runs stAgentApp (the tray/watchdog) in the user's
+    # graphical session; the shipped stagentapp.service targets default.target,
+    # rewired here to graphical-session.target.
+    systemd.user.services.stagentapp = lib.mkIf cfg.enableTray {
+      description = "Netskope client tray agent";
+      wantedBy = [ "graphical-session.target" ];
+      partOf = [ "graphical-session.target" ];
+      after = [ "graphical-session.target" ];
+      serviceConfig = {
+        Type = "simple";
+        ExecStart = "/opt/netskope/stagent/stAgentApp";
+        Restart = "on-failure";
+        RestartSec = 5;
       };
     };
   };

@@ -1,0 +1,12 @@
+# Nix build outputs
+result
+result-*
+
+# Editor / OS cruft
+.direnv/
+*.swp
+.DS_Store
+
+# Never commit the proprietary, non-redistributable installer
+*.run
+NSClient.run

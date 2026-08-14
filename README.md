@@ -4,54 +4,85 @@ A NixOS flake that packages the proprietary **Netskope Client for Linux** (x86_6
 exposes it as a NixOS module. Planning and decisions are tracked as a
 [wayfinder map](https://github.com/lcleveland/netskope-client/issues/1).
 
-> **Status: work in progress.** The packaging derivation (this commit) is complete but
-> has **not yet been build-verified on a Nix host** — it was authored in an environment
-> without Nix. Enrollment, CA trust, and writable-state relocation are not implemented
-> yet (see the map).
+> **Status: work in progress.** The module is feature-complete — packaging, writable-state
+> relocation, headless token/org-key enrollment, and CA trust — but has **not** been build-
+> or run-verified on a Nix host yet ([#10](https://github.com/lcleveland/netskope-client/issues/10)).
+> Verify before relying on it; the enrollment handshake in particular is untested.
 
-## Getting the installer
-
-The client is proprietary, **rebuilt per tenant, and not redistributable**, so you must
-supply `NSClient.run` yourself:
-
-1. Download it from your tenant — admin console **Settings → Tools → Downloads → Linux**
-   (choose the `.run`), or `https://download-<tenant>.goskope.com/dlr/linux/get`.
-2. Add it to the Nix store:
-
-   ```sh
-   nix-store --add-fixed sha256 NSClient.run
-   ```
-
-The pinned default hash targets the `lselectric` **v140.0.2.2763** build. If your tenant
-serves a different build, override the `src` argument of the package.
-
-## Usage
+## Quick start
 
 ```nix
 {
   inputs.netskope.url = "github:lcleveland/netskope-client";
 
-  # in your NixOS configuration:
+  # ... in your NixOS configuration:
   imports = [ netskope.nixosModules.default ];
-  nixpkgs.config.allowUnfree = true;   # the client is unfree
-  services.netskope.enable = true;
-  services.netskope.enableTray = true; # false = daemon-only, drops the GTK/WebKit closure
+  nixpkgs.config.allowUnfree = true; # the client is unfree
+
+  services.netskope = {
+    enable = true;
+    tenant = "lselectric";  # fetches the installer from the tenant (public, no auth)
+    hash = "sha256-lOAsV+/zV1KNZBraDw8qa7nL4SDu0GH3who7fgLhQTI="; # bump on version change
+
+    enrollment = {
+      orgKeyFile    = "/run/secrets/netskope-orgkey";    # value of Windows `token=`
+      authTokenFile = "/run/secrets/netskope-authtoken"; # value of Windows `enrollauthtoken=`
+    };
+
+    trustCA = true;
+    caCertFile = "/etc/netskope/nstenantcert.crt";
+  };
 }
 ```
 
+## Client source
+
+The installer is fetched from `https://download-<tenant>.goskope.com/dlr/linux/get`
+(**public, no authentication**) — just set `tenant` + `hash`. The hash changes when
+Netskope pushes a new client version to your tenant; refresh it with:
+
+```sh
+nix store prefetch-file --name NSClient.run \
+  "https://download-<tenant>.goskope.com/dlr/linux/get"
+```
+
+Alternatives: `sourceUrl` (an internal mirror) + `hash`; or offline via `requireFile`
+(`nix-store --add-fixed sha256 NSClient.run`) or
+`package = pkgs.netskope-client.override { src = ./NSClient.run; }`.
+The installer is **proprietary and non-redistributable** — don't commit it.
+
+## Secrets
+
+`enrollment.orgKeyFile` / `authTokenFile` / `encryptTokenFile` are **absolute paths to
+runtime files** (typed as strings, never Nix paths, so they are never copied into the
+world-readable `/nix/store`). Provide them via sops-nix, agenix, or a root-only file; the
+enrollment service reads them through systemd credentials at activation.
+
+## Options
+
+| Option | Purpose |
+|---|---|
+| `enable` | turn the client on |
+| `tenant` / `hash` / `sourceUrl` | client source (see above) |
+| `package` | override the built package |
+| `enableTray` (default `true`) | tray UI: `stAgentUI` + `stagentapp` user service |
+| `tenantHost` | enrollment host (defaults to `addon-<tenant>.goskope.com`) |
+| `enrollment.{orgKeyFile,authTokenFile,encryptTokenFile,email,upn}` | enrollment params |
+| `trustCA` / `caCertFile` | add the Netskope root CA to system trust |
+| `autoUpdate` (default `false`) | client self-update — unsupported on Nix |
+
 ## Packaging approach
 
-- **Strategy: `autoPatchelfHook`** over a user-supplied `NSClient.run`.
-  The `.run` is a Makeself self-extractor; the payload (a raw client tree) is carved out
-  by the header's declared offset — no `dpkg`/`.deb` step.
-- Only `stAgentUI` (the tray) links stale sonames; they're rewritten with
-  `patchelf --replace-needed` (WebKitGTK 4.0→4.1, JSCore 4.0→4.1, appindicator3→ayatana)
-  before autoPatchelf resolves the rest. Every other binary needs only stdlibs (and NSS
-  for the bundled `certutil`), and none carry a RUNPATH — so autoPatchelf is a clean fit.
-  `buildFHSEnv` is the documented fallback if `/opt` path assumptions prove too brittle.
+`autoPatchelfHook` over the `.run` payload (carved by the makeself header offset — no
+`dpkg`). Only `stAgentUI` needs soname swaps (WebKitGTK 4.0→4.1, JSCore 4.0→4.1,
+appindicator3→ayatana); everything else needs stdlibs (and NSS for `certutil`).
+`buildFHSEnv` is the documented fallback. The client hard-codes `/opt/netskope/stagent`
+and writes state there, so the module materialises that path as a real directory with
+`data/` and `logs/` redirected to `/var/lib/netskope`.
 
 ## Layout
 
-- `flake.nix` — outputs: `packages.x86_64-linux.*`, `nixosModules.default`, `devShell`, `formatter`.
+- `flake.nix` — `packages`, `nixosModules.default`, `checks` (VM test), `devShell`, `formatter`.
 - `pkgs/netskope-client.nix` — the package derivation.
-- `modules/netskope.nix` — the NixOS module (prototype: package + daemon unit only).
+- `modules/netskope.nix` — the NixOS module.
+- `tests/module.nix` — VM test (scaffold; run under #10).

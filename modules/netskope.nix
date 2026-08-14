@@ -7,6 +7,9 @@
 
 let
   cfg = config.services.netskope;
+  enr = cfg.enrollment;
+  optStr = s: if s == null then "" else s;
+  enrollmentConfigured = cfg.tenantHost != "" && enr.orgKeyFile != null;
 in
 {
   options.services.netskope = {
@@ -40,26 +43,101 @@ in
     caCertFile = lib.mkOption {
       type = lib.types.nullOr lib.types.path;
       default = null;
-      example = "/etc/netskope/nscacert.pem";
+      example = "/etc/netskope/nstenantcert.crt";
       description = ''
         Path to the Netskope root CA (PEM) used for SSL inspection. The installer
         does NOT ship it, so it cannot be derived from the package; obtain it from
-        your tenant admin console, or copy /var/lib/netskope/data/nscacert.pem off
-        an already-enrolled host.
+        your tenant admin console, or copy it off an already-enrolled host (the
+        client names it `nstenantcert.crt`; under this module's state relocation it
+        lands at /var/lib/netskope/data/).
+      '';
+    };
+
+    tenantHost = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      example = "addon-<tenant>.goskope.com";
+      description = ''
+        Tenant enrollment host (the addon/gateway host). Maps to the client's
+        -H/--tenantHostname. Not a credential, but tenant-identifying -- set it in
+        your own configuration. Leave empty to package the client without
+        declarative enrollment.
+      '';
+    };
+
+    enrollment = {
+      orgKeyFile = lib.mkOption {
+        # NB: string, not path -- a `path` would be copied into the world-readable
+        # /nix/store when interpolated. This is an absolute path resolved at runtime.
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "/run/secrets/netskope-orgkey";
+        description = ''
+          Absolute path to a runtime file containing the organization key -- the
+          value deployed as `token=` on Windows; the client's -o/--orgkey. Loaded
+          via systemd credentials at runtime; the key never enters the Nix store.
+        '';
+      };
+
+      authTokenFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "/run/secrets/netskope-authtoken";
+        description = ''
+          Absolute path to a runtime file containing the secure-enrollment auth
+          token -- Windows `enrollauthtoken=`; the client's -a/--enroll-auth-token.
+          Loaded via systemd credentials at runtime.
+        '';
+      };
+
+      encryptTokenFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = ''
+          Optional absolute path to a runtime file containing the secure-enrollment
+          encrypt token (-e/--enroll-encrypt-token), if your tenant requires it.
+          Loaded via systemd credentials.
+        '';
+      };
+
+      email = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = ''
+          Optional user email for email-mode enrollment (-m/--email). Not needed
+          when enrolling with an org key + auth token.
+        '';
+      };
+
+      upn = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Optional UPN for non-domain-joined enrollment (-u/--upn).";
+      };
+    };
+
+    autoUpdate = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Allow the client to self-update. Off by default and effectively unsupported
+        on NixOS: the client lives in the immutable /nix/store and cannot replace
+        its own binaries. Update by bumping the packaged NSClient.run instead.
+        (Windows deployments use autoupdate=on; on NixOS that responsibility moves
+        to the Nix package.)
       '';
     };
   };
 
   config = lib.mkIf cfg.enable {
     # ------------------------------------------------------------------
-    # SCOPE. Packaging (#5), writable-state relocation (#7), and CA trust (#8)
-    # are implemented. Still tracked as separate tickets and NOT wired up yet --
-    # the daemon won't enroll until these land:
+    # SCOPE. Packaging (#5), writable-state relocation (#7), CA trust (#8), and
+    # declarative token/org-key enrollment (#6) are implemented. Remaining:
     #
-    #   #6  declarative token/org-key enrollment + secret handling (installerutil)
-    #   #9  full option schema (tenant/source URL/tray user/etc.)
-    #
-    # Build-verification of the whole thing on a Nix host is #10.
+    #   #9   option-schema polish (client source: requireFile / URL / tenant) + a
+    #        NixOS VM test
+    #   #10  build + runtime verification on a real Nix host (this was authored
+    #        without Nix; the enrollment handshake in particular is unverified)
     # ------------------------------------------------------------------
 
     assertions = [
@@ -71,7 +149,14 @@ in
         assertion = cfg.trustCA -> cfg.caCertFile != null;
         message = "services.netskope.trustCA is enabled but services.netskope.caCertFile is unset — supply the Netskope root CA PEM (the installer does not ship it).";
       }
+      {
+        assertion = (enr.orgKeyFile != null) -> (cfg.tenantHost != "");
+        message = "services.netskope.enrollment.orgKeyFile is set but services.netskope.tenantHost is empty — set the tenant host.";
+      }
     ];
+
+    warnings = lib.optional cfg.autoUpdate
+      "services.netskope.autoUpdate has no real effect on NixOS: the client cannot self-update the immutable store. Bump the packaged NSClient.run instead.";
 
     environment.systemPackages = [ cfg.package ];
 
@@ -125,6 +210,60 @@ in
       '';
     };
 
+    # Declarative token/org-key enrollment (issue #6).
+    #
+    # Mirrors install.sh: installerutil fetches the tenant branding/enrollment
+    # config from a JSON envelope (TenantHostname + Orgkey + EnrollAuthToken), then
+    # the daemon completes device enrollment. Secrets are read from root-only
+    # systemd credential files at runtime -- their values never enter the unit
+    # definition, the Nix store, or nixos-rebuild logs. Only created when a tenant
+    # host and org key are configured.
+    #
+    # NOTE: the exact enrollment handshake is pending real-host verification (#10);
+    # the option surface and secret handling are the settled part.
+    systemd.services.netskope-enroll = lib.mkIf enrollmentConfigured {
+      description = "Enroll the Netskope client with the ${cfg.tenantHost} tenant";
+      wantedBy = [ "multi-user.target" ];
+      requires = [ "netskope-setup.service" ];
+      after = [
+        "netskope-setup.service"
+        "network-online.target"
+      ];
+      wants = [ "network-online.target" ];
+      before = [ "stagentd.service" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        LoadCredential =
+          [ "orgkey:${enr.orgKeyFile}" ]
+          ++ lib.optional (enr.authTokenFile != null) "authtoken:${enr.authTokenFile}"
+          ++ lib.optional (enr.encryptTokenFile != null) "encrypttoken:${enr.encryptTokenFile}";
+      };
+      script = ''
+        set -eu
+        appPath=/opt/netskope/stagent
+
+        # Idempotent: the .eetk token is written on successful enrollment.
+        if [ -e "$appPath/.eetk" ] || [ -e /var/lib/netskope/data/.eetk ]; then
+          echo "netskope: already enrolled, skipping"
+          exit 0
+        fi
+
+        orgkey="$(cat "$CREDENTIALS_DIRECTORY/orgkey")"
+        authtoken=""
+        [ -e "$CREDENTIALS_DIRECTORY/authtoken" ] && authtoken="$(cat "$CREDENTIALS_DIRECTORY/authtoken")"
+        encrypttoken=""
+        [ -e "$CREDENTIALS_DIRECTORY/encrypttoken" ] && encrypttoken="$(cat "$CREDENTIALS_DIRECTORY/encrypttoken")"
+
+        report="enroll.$$"
+
+        # install.sh's enrollment envelope, verbatim field set.
+        json="{\"LoginUser\":\"root\",\"ReportFileName\":\"$report\",\"MyRunFileName\":\"\",\"TenantHostname\":\"${cfg.tenantHost}\",\"Orgkey\":\"$orgkey\",\"UserEmail\":\"${optStr enr.email}\",\"UserUpn\":\"${optStr enr.upn}\",\"IdpMode\":\"\",\"TenantName\":\"\",\"TenantDomain\":\"\",\"EnrollAuthToken\":\"$authtoken\",\"EnrollEncryptToken\":\"$encrypttoken\",\"InstallTags\":\"\"}"
+
+        "$appPath/installerutil" "--download_branding_file" "$json"
+      '';
+    };
+
     systemd.services.stagentd = {
       description = "Netskope client daemon";
       wantedBy = [ "multi-user.target" ];
@@ -132,8 +271,8 @@ in
       after = [
         "network-online.target"
         "netskope-setup.service"
-      ];
-      wants = [ "network-online.target" ];
+      ] ++ lib.optional enrollmentConfigured "netskope-enroll.service";
+      wants = [ "network-online.target" ] ++ lib.optional enrollmentConfigured "netskope-enroll.service";
       path = [ pkgs.iptables ]; # steering programs iptables at runtime
       serviceConfig = {
         Type = "simple";

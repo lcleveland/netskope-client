@@ -27,17 +27,37 @@ in
         Disable on headless hosts to drop the heavy GTK/WebKit closure.
       '';
     };
+
+    trustCA = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Add the Netskope SSL-inspection root CA to the system trust store.
+        This is a MITM certificate, so opt in deliberately. Requires `caCertFile`.
+      '';
+    };
+
+    caCertFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      example = "/etc/netskope/nscacert.pem";
+      description = ''
+        Path to the Netskope root CA (PEM) used for SSL inspection. The installer
+        does NOT ship it, so it cannot be derived from the package; obtain it from
+        your tenant admin console, or copy /var/lib/netskope/data/nscacert.pem off
+        an already-enrolled host.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
     # ------------------------------------------------------------------
-    # SCOPE. Packaging (#5) and writable-state relocation (#7) are implemented.
-    # Still tracked as separate tickets and NOT wired up yet -- the daemon won't
-    # enroll (and SSL inspection won't be trusted) until these land:
+    # SCOPE. Packaging (#5), writable-state relocation (#7), and CA trust (#8)
+    # are implemented. Still tracked as separate tickets and NOT wired up yet --
+    # the daemon won't enroll until these land:
     #
     #   #6  declarative token/org-key enrollment + secret handling (installerutil)
-    #   #8  Netskope root CA trust  (security.pki.certificateFiles = caCertPath)
-    #   #9  full option schema (tenant/source URL/CA toggle/tray user/etc.)
+    #   #9  full option schema (tenant/source URL/tray user/etc.)
     #
     # Build-verification of the whole thing on a Nix host is #10.
     # ------------------------------------------------------------------
@@ -47,9 +67,18 @@ in
         assertion = pkgs.stdenv.hostPlatform.system == "x86_64-linux";
         message = "services.netskope: Netskope ships no Linux client for ${pkgs.stdenv.hostPlatform.system} (x86_64-linux only).";
       }
+      {
+        assertion = cfg.trustCA -> cfg.caCertFile != null;
+        message = "services.netskope.trustCA is enabled but services.netskope.caCertFile is unset — supply the Netskope root CA PEM (the installer does not ship it).";
+      }
     ];
 
     environment.systemPackages = [ cfg.package ];
+
+    # Netskope's SSL inspection MITMs TLS, so its root CA must be trusted
+    # system-wide (issue #8). The installer does not ship the cert, so the user
+    # supplies it via caCertFile; it is added at build time to the system bundle.
+    security.pki.certificateFiles = lib.mkIf (cfg.trustCA && cfg.caCertFile != null) [ cfg.caCertFile ];
 
     # Writable-state relocation (issue #7).
     #

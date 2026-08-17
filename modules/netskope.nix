@@ -47,6 +47,32 @@ let
     ln -s ${config.security.pki.caBundle} ca-certificates.crt
   '';
 
+  # The helper commands the daemon shells out to, at the one path it looks for them.
+  #
+  # It resolves them as /usr/sbin/<name>, NOT through PATH. That was established the
+  # hard way, by running the daemon against a throwaway copy of its app dir and
+  # watching nsdebuglog: with iproute2 on the unit's PATH it still logged "Command ip
+  # not found!", and it still did with /usr/bin/ip in place; adding /usr/sbin/ip is
+  # what silenced it and let "reset stAgent route rules" run. (systemd.services.*.path
+  # is therefore useless here -- it was tried, shipped, and did nothing.)
+  #
+  # Deliberately absent: update-ca-certificates. Its presence would send the CA
+  # installer down its Debian branch, into a /usr/local/share/ca-certificates that
+  # does not exist here -- see the CA notes on stagentd.service.
+  fhsTools = pkgs.runCommandLocal "netskope-fhs-tools" { } ''
+    mkdir -p $out
+    # Steering: the client drives its TUN device with `ip route`/`ip rule` and
+    # programs the mangle table.
+    ln -s ${pkgs.iproute2}/bin/ip $out/ip
+    ln -s ${pkgs.iptables}/bin/iptables $out/iptables
+    ln -s ${pkgs.iptables}/bin/ip6tables $out/ip6tables
+    # Device make/model/serial reported to the tenant; falls back to sysfs, but the
+    # daemon probes for it on every config cycle.
+    ln -s ${pkgs.dmidecode}/bin/dmidecode $out/dmidecode
+    # Flushing the DNS cache when steering changes.
+    ln -s ${config.systemd.package}/bin/resolvectl $out/resolvectl
+  '';
+
   # Stand-in for the distro tool that rebuilds the system trust store from its
   # anchors directory -- see the CA-install notes on stagentd.service below.
   caTrustShim = pkgs.writeShellScript "netskope-update-ca-trust" ''
@@ -520,31 +546,8 @@ in
       ]
       ++ lib.optional enrollmentConfigured "netskope-enroll.service";
       wants = [ "network-online.target" ] ++ lib.optional enrollmentConfigured "netskope-enroll.service";
-      # Runtime tools the daemon shells out to. It resolves them through PATH (not
-      # absolute FHS paths), so putting them here is enough.
-      #
-      # iproute2 is load-bearing for steering, and its absence is quiet: the tunnel
-      # comes up fine, then the filter device that actually intercepts traffic fails
-      # to start, so the client reports "Internet Security disabled due to error"
-      # while looking otherwise healthy. Verified on a real host:
-      #
-      #   nsTunHandler.cpp:516  Failed to find ip or iptables command
-      #   nsNetTool.cpp:79      Command ip not found!
-      #   tunnelMgr.cpp:1288    failed to start filter device
-      #   tunnel.cpp:447        TLS received nsssl_closed, tunnel destroyed
-      #
-      # The client drives its TUN device with `ip route`/`ip rule` (policy routing on
-      # table 1 with an fwmark) and asks `ip route get` for the egress interface --
-      # which is also why the MTU probe logs "Failed to get MTU on device = ".
-      #
-      # dmidecode is not fatal: the device make/model/serial it reports to the tenant
-      # come from sysfs when it is missing, but the daemon still probes for it (18
-      # "Command dmidecode not found!" in a single boot), so give it the real thing.
-      path = [
-        pkgs.iptables
-        pkgs.iproute2
-        pkgs.dmidecode
-      ];
+      # NB: no `path`. The daemon ignores PATH for its helper commands and looks them
+      # up at /usr/sbin/<name> instead; they are bound in there (see fhsTools).
       serviceConfig = {
         Type = "simple";
         # Launch via the materialised /opt path (not the store) so the client's
@@ -584,9 +587,22 @@ in
         #    answer to caCertFile's chicken-and-egg problem -- the installer ships no
         #    CA, but an enrolled client writes one to
         #    ''${statePath}/ca-anchors/nstenantcert.crt.
+        # 3. Steering itself. Without /usr/sbin/ip the failure is quiet and easy to
+        #    misread: the TLS tunnel to the POP comes up and is logged as established
+        #    with an assigned IP, and only THEN does the filter device that actually
+        #    intercepts traffic fail, so the daemon keeps running and looks healthy
+        #    while steering nothing --
+        #
+        #      tunnel.cpp:988      TLS Tunnel established to gateway: ..., pop: US-STL1
+        #      nsNetTool.cpp:79    Command ip not found!
+        #      tunnelMgr.cpp:1288  failed to start filter device
+        #      tunnel.cpp:447      TLS received nsssl_closed, tunnel destroyed
+        #
+        #    -- and stAgentCli reports only "Internet Security disabled due to error".
         BindReadOnlyPaths = [
           "${caCertDir}:/etc/ssl/certs"
           "${caTrustShim}:/usr/bin/update-ca-trust"
+          "${fhsTools}:/usr/sbin"
         ];
         BindPaths = [ "${cfg.statePath}/ca-anchors:/etc/pki/ca-trust/source/anchors" ];
         # Empty tmpfs mount points for the two trees above to be created in. /usr

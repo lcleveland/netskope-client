@@ -28,8 +28,12 @@ exposes it as a NixOS module. Planning and decisions are tracked as a
 > filter device fails to start and the client reports `Internet Security disabled due
 > to error` while looking healthy.
 >
-> Not yet verified: that steering actually carries traffic once the filter device
-> starts, and the user certificate.
+> **Steering starts, and then breaks connectivity.** With the tools in place the
+> client brings its filter device up (`Enable NS packet filter for web mode`, ports
+> 80/443, tunnel up) — and from that moment name resolution fails, sockets time out,
+> and eventually the client's own control traffic times out and the tunnel drops.
+> Unresolved; see [Steering](#steering) for what is known. `autoStart = false` exists
+> so you can investigate this without a machine that needs a reboot to recover.
 
 ## Quick start
 
@@ -180,6 +184,35 @@ The client drives its TUN device with `ip route` / `ip rule` (policy routing on 
 with an fwmark) and asks `ip route get` for the egress interface, which is also why a
 missing `ip` shows up as `Failed to get MTU on device = `.
 
+## Steering
+
+**Status: gets as far as breaking your network.** Once the client can find its tools
+it brings the filter device up properly — interface detected, TUN device opened, IP
+exceptions for RFC1918 installed, `Enable NS packet filter for web mode`, `Tunnel Up`.
+Then connectivity degrades: sockets time out, name resolution fails, and after a few
+minutes the client's own control traffic times out too (`curl code 28`, `GSLB fetch
+failed`) and the tunnel drops with `Tunnel down due to error`.
+
+What is ruled out: the egress interface *is* detected (`physical interface: wlp2s0`,
+MTU 1500), the tunnel *does* establish to the POP with an assigned IP, and the host
+firewall is iptables-backed (`networking.nftables.enable = false`), so the client's
+mangle rules and NixOS' filter rules are not on different backends.
+
+Open leads: the tunnel MTU is taken straight from the physical interface (1500) with
+no visible allowance for encapsulation, which would blackhole full-size packets while
+leaving small ones fine; `nsRtNetlink ipRouteGet: failed to get response` appears four
+times while steering is being set up; and DNS is explicitly steered
+(`set IPv4/IPv6 DNS packet filtering rules`) on a host whose resolver is
+systemd-resolved on 127.0.0.53.
+
+**Do not debug this on a machine you depend on without `autoStart = false`.** The
+tenant can forbid `stAgentCli disable`, and the daemon reinstates its rules when it
+restarts, so the recovery path is otherwise a reboot into an older generation.
+
+```nix
+services.netskope.autoStart = false;   # then: systemctl start stagentd
+```
+
 ## Options
 
 | Option | Purpose |
@@ -192,6 +225,7 @@ missing `ip` shows up as `Failed to get MTU on device = `.
 | `tenantHost` | tenant hostname, **not** the addon host (defaults to `<tenant>.goskope.com`) |
 | `enrollment.{orgKeyFile,authTokenFile,encryptTokenFile,email,upn}` | enrollment params |
 | `trustCA` / `caCertFile` | add the Netskope root CA to system trust |
+| `autoStart` (default `true`) | start the daemon at boot; false = start it by hand |
 | `autoUpdate` (default `false`) | client self-update — unsupported on Nix |
 
 ## Packaging approach

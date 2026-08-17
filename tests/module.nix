@@ -69,6 +69,15 @@ pkgs.testers.runNixOSTest {
     machine.wait_for_unit("stagentd.service")
     machine.succeed("systemctl is-active stagentd.service")
 
+    # autoStart's escape hatch has to actually work: stopping the daemon must be
+    # enough to take the client out of the traffic path, and it must not come back
+    # on its own. (Restart=always applies to the process dying, not to `stop`.)
+    machine.succeed("systemctl stop stagentd.service")
+    machine.succeed("sleep 12")  # outlives RestartSec=10
+    machine.fail("systemctl is-active --quiet stagentd.service")
+    machine.succeed("systemctl start stagentd.service")
+    machine.wait_for_unit("stagentd.service")
+
     # The client verifies TLS peers with a compiled-in OpenSSL CApath of
     # /etc/ssl/certs, and a CApath resolves anchors through <subject-hash>.<seq>
     # symlinks that NixOS' /etc/ssl/certs does not have -- so without a rehashed

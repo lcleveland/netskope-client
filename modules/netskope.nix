@@ -276,6 +276,25 @@ in
       };
     };
 
+    autoStart = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Start the daemon (and the tray) at boot. Set to false to leave the client
+        installed but dormant, brought up on demand with `systemctl start stagentd`.
+
+        This is the escape hatch for bringing steering up on a machine you depend on.
+        The moment the client's tunnel connects it captures all web traffic, and if
+        that goes wrong the recovery is a reboot into an older generation: the tenant
+        can forbid `stAgentCli disable` (allowClientDisabling=false), and the daemon
+        restores its rules on restart. With autoStart = false the same mistake is one
+        `systemctl stop stagentd` away, and a reboot always comes up clean.
+
+        Note that a dormant client is also an unenrolled and un-updated one -- nothing
+        polls the tenant until you start it.
+      '';
+    };
+
     autoUpdate = lib.mkOption {
       type = lib.types.bool;
       default = false;
@@ -538,7 +557,11 @@ in
 
     systemd.services.stagentd = {
       description = "Netskope client daemon";
-      wantedBy = [ "multi-user.target" ];
+      # Gated on autoStart: starting this is what puts the client in the traffic
+      # path, so it is the one unit worth being able to hold back. netskope-setup
+      # and netskope-enroll still run at boot -- they only materialise /opt and
+      # fetch branding, and `systemctl start stagentd` pulls setup in anyway.
+      wantedBy = lib.optional cfg.autoStart "multi-user.target";
       requires = [ "netskope-setup.service" ];
       after = [
         "network-online.target"
@@ -546,8 +569,20 @@ in
       ]
       ++ lib.optional enrollmentConfigured "netskope-enroll.service";
       wants = [ "network-online.target" ] ++ lib.optional enrollmentConfigured "netskope-enroll.service";
-      # NB: no `path`. The daemon ignores PATH for its helper commands and looks them
-      # up at /usr/sbin/<name> instead; they are bound in there (see fhsTools).
+      # The client uses BOTH lookup mechanisms, so it needs both halves. Its net
+      # tooling is resolved as /usr/sbin/<name> and ignores PATH entirely (see
+      # fhsTools) -- but some calls just hand a bare name to a shell, and those do
+      # use PATH. With no `path` set, the journal fills with
+      #
+      #   stAgentSvc[2966]: sh: line 1: systemd-resolved: command not found
+      #
+      # from its DNS-cache flush. Set both; neither alone is sufficient.
+      path = [
+        config.systemd.package # resolvectl, for the DNS flush
+        pkgs.iproute2
+        pkgs.iptables
+        pkgs.dmidecode
+      ];
       serviceConfig = {
         Type = "simple";
         # Launch via the materialised /opt path (not the store) so the client's
@@ -636,7 +671,8 @@ in
     systemd.user.services = lib.mkIf cfg.enableTray {
       stagentapp = {
         description = "Netskope client tray agent (watchdog)";
-        wantedBy = [ "graphical-session.target" ];
+        # No point drawing a tray for a daemon that is not running -- see autoStart.
+        wantedBy = lib.optional cfg.autoStart "graphical-session.target";
         partOf = [ "graphical-session.target" ];
         after = [ "graphical-session.target" ];
         serviceConfig = {
@@ -655,7 +691,7 @@ in
 
       stagentui = {
         description = "Netskope client tray icon";
-        wantedBy = [ "graphical-session.target" ];
+        wantedBy = lib.optional cfg.autoStart "graphical-session.target";
         partOf = [ "graphical-session.target" ];
         after = [
           "graphical-session.target"

@@ -25,7 +25,9 @@ in
       description = ''
         The netskope-client package to run. By default it is built from the
         `tenant`/`hash`/`sourceUrl` options; override to supply a custom build
-        (e.g. `pkgs.netskope-client.override { src = ./NSClient.run; }`).
+        (e.g. `pkgs.netskope-client.override { srcOverride = ./NSClient.run; }`).
+        The argument is `srcOverride`, not `src`, because callPackage would
+        auto-fill an argument named `src` from nixpkgs' throwing `pkgs.src` alias.
       '';
     };
 

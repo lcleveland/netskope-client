@@ -2,118 +2,130 @@
 # Bring Netskope steering up under a dead-man's switch.
 #
 # The client has no runtime off-switch worth relying on -- a tenant can set
-# allowClientDisabling=false, which refuses `stAgentCli disable`, and the daemon
-# reinstates its rules whenever it restarts. So the only safe way to watch it steer
-# is to make something else responsible for turning it off. This starts the daemon
-# (and the tray, without which it never builds a user tunnel), probes connectivity,
-# and stops both the moment connectivity dies -- or when the hard timeout expires,
-# or if this script is killed. Networking is never left broken waiting on a human.
+# allowClientDisabling=false, and the daemon reinstates its rules whenever it
+# restarts -- so the only safe way to watch it steer is to make something else
+# responsible for turning it off. This starts the client, probes connectivity every
+# few seconds, and tears everything down the moment connectivity dies, when the hard
+# timeout expires, or if this script is killed. It never leaves the network broken
+# waiting on a human.
 #
-# Pair it with services.netskope.autoStart = false, so a bad boot cannot beat you to
-# it. Requires permission to start/stop stagentd (root, or a polkit rule for wheel).
+# Pair it with services.netskope.autoStart = false, so a bad run costs one command
+# rather than a reboot into an older generation.
 #
-#   ./steering-test.sh                 # 200s window, backs out after ~6s of loss
-#   HARD_TIMEOUT=60 ./steering-test.sh # shorter leash
+#   ./steering-test.sh                 # run with the current firewall settings
+#   HARD_TIMEOUT=180 ./steering-test.sh
+#   CERT=/path/to/nstenantcert.crt ./steering-test.sh   # also probe TLS via tenant CA
 #
-# The probes are chosen to tell the failure modes apart rather than just say "down":
-# ICMP is never marked by the client, so `ping` surviving while TCP dies means
-# traffic is being steered into a hole rather than the link being down; and a
-# full-size DF ping distinguishes an MTU blackhole from a routing one.
+# Requires: rights to start/stop system units and to run `systemd-run --system`
+# (wheel + polkit is enough; it does not need an interactive sudo).
 
 set -u
 
-HARD_TIMEOUT="${HARD_TIMEOUT:-200}"
+HARD_TIMEOUT="${HARD_TIMEOUT:-90}"
 FAIL_THRESHOLD="${FAIL_THRESHOLD:-2}"
 LOG="${LOG:-${TMPDIR:-/tmp}/netskope-steering-$(date +%Y%m%d-%H%M%S).log}"
+CERT="${CERT:-/var/lib/netskope/ca-anchors/nstenantcert.crt}"
+SW="${SW:-/run/current-system/sw/bin}"
 
 say() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOG"; }
-
-snapshot() {
-  say "  | links:   $(ip -br link 2>/dev/null | awk '{print $1}' | tr '\n' ' ')"
-  say "  | ip rule: $(ip rule list 2>/dev/null | tr '\n' ' ')"
-  # The client policy-routes marked traffic into its own table; if that table has no
-  # default route, everything steered is silently dropped.
-  for t in 1 9; do
-    say "  | table $t: $(ip route show table $t 2>/dev/null | tr '\n' ' ')"
-  done
-  say "  | default: $(ip route show default 2>/dev/null | tr '\n' ' ')"
-}
+asroot() { systemd-run --system --pipe --quiet --collect "$@" 2>&1; }
 
 backed_out=0
 backout() {
   [ "$backed_out" = 1 ] && return
   backed_out=1
-  say "BACKOUT: stopping tray + stagentd"
-  systemctl --user stop stagentui stagentapp >>"$LOG" 2>&1
-  systemctl stop stagentd >>"$LOG" 2>&1
-  sleep 3
-  say "post-stop: stagentd=$(systemctl is-active stagentd)"
-  snapshot
-  for i in 1 2 3 4 5 6; do
-    if timeout 4 getent hosts example.com >/dev/null 2>&1; then
-      say "RECOVERED: DNS resolves again ($((i * 2))s after stop)"
-      say "NB: the daemon has been seen to SEGV on stop and leave its rules behind."
-      say "    If anything still misbehaves: ip rule del fwmark 0x5 lookup 9;"
-      say "    ip route flush table 9   (both need root)"
-      return
-    fi
+  say "BACKOUT: stop-then-kill, then flush leftovers as root"
+
+  # Order matters, and both halves are load-bearing:
+  #   - `systemctl stop` alone does NOT stop this daemon promptly. Its shutdown path
+  #     does network work that hangs when the network is down; 30s after stop it was
+  #     still running with its rules installed.
+  #   - `kill -s KILL` alone makes systemd restart it, because the unit is
+  #     Restart=always. Marking it stopping first is what prevents that.
+  systemctl --user stop stagentui stagentapp >>"$LOG" 2>&1 &
+  systemctl stop --no-block stagentd >>"$LOG" 2>&1
+  systemctl kill -s KILL stagentd >>"$LOG" 2>&1
+
+  # A killed client cleans up nothing, so undo its plumbing directly.
+  for _ in 1 2 3 4 5; do
+    $SW/ip rule list 2>/dev/null | grep -q "fwmark 0x5" || break
+    asroot $SW/ip rule del fwmark 0x5 table 9 >/dev/null
+  done
+  asroot $SW/ip route flush table 9 >/dev/null
+  asroot $SW/ip link del sta0 >/dev/null
+  asroot $SW/systemctl restart firewall.service >/dev/null   # also undoes any test rules
+  asroot $SW/resolvectl flush-caches >/dev/null
+
+  say "post-cleanup: stagentd=$(systemctl is-active stagentd) sta0=$($SW/ip -o link show sta0 2>/dev/null | wc -l) fwmark-rules=$($SW/ip rule list | grep -c fwmark)"
+  for i in 1 2 3 4 5 6 7 8; do
+    timeout 4 getent hosts example.com >/dev/null 2>&1 && { say "RECOVERED after $((i * 2))s"; return; }
     sleep 2
   done
-  say "STILL BROKEN after stop -- leftover rules; flush as above, or reboot"
+  say "STILL BROKEN -- restarting NetworkManager"
+  asroot $SW/systemctl restart NetworkManager.service >/dev/null
+  for i in 1 2 3 4 5 6; do
+    timeout 4 getent hosts example.com >/dev/null 2>&1 && { say "RECOVERED after NM restart"; return; }
+    sleep 2
+  done
+  say "STILL BROKEN after NM restart -- inspect $LOG"
 }
-# INT/TERM must back out AND leave: a trap that merely returns drops back into the
-# probe loop.
 trap 'backout; exit 0' INT TERM
 trap backout EXIT
 
+# Probes chosen to tell the failure modes apart rather than just say "down":
+#   dns/tcp   -- is steered traffic getting through at all
+#   tls       -- fails on its own once steering is live, if the tenant CA is untrusted
+#   TLSca     -- same request trusting the tenant CA; 1 proves traffic really is
+#                going through the tenant's gateway
+#   ping      -- unsteered control. Staying up while dns/tcp die means the *return
+#                path* is being dropped (hello, strict rpfilter), not the link.
 probe_round() {
-  local dns=0 tcp=0 tls=0 small=0 big=0
+  local dns=0 tcp=0 tls=0 tlsca=0 icmp=0
   timeout 3 getent hosts example.com >/dev/null 2>&1 && dns=1
   timeout 3 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>/dev/null && tcp=1
-  timeout 5 curl -sS -o /dev/null https://example.com 2>/dev/null && tls=1
-  timeout 3 ping -c1 -W2 -s 56 1.1.1.1 >/dev/null 2>&1 && small=1
-  timeout 4 ping -c1 -W3 -M do -s 1372 1.1.1.1 >/dev/null 2>&1 && big=1
-  echo "$dns $tcp $tls $small $big"
+  timeout 6 curl -sS -o /dev/null https://example.com 2>/dev/null && tls=1
+  [ -r "$CERT" ] && timeout 6 curl -sS -o /dev/null --cacert "$CERT" https://example.com 2>/dev/null && tlsca=1
+  timeout 3 ping -c1 -W2 1.1.1.1 >/dev/null 2>&1 && icmp=1
+  echo "$dns $tcp $tls $tlsca $icmp"
 }
 
+say "log: $LOG"
 say "=== baseline (steering off) ==="
-say "probe[dns tcp tls ping56 ping1372]: $(probe_round)"
-snapshot
+say "probe[dns tcp tls TLSca icmp]: $(probe_round)"
 
 say "=== starting stagentd + tray (hard timeout ${HARD_TIMEOUT}s) ==="
 systemctl start stagentd >>"$LOG" 2>&1 || { say "daemon start failed"; exit 1; }
 sleep 2
-# Without the per-user agent the daemon has no session ("Failed to get Active User
-# Session ID") and never builds a tunnel, so steering is never exercised.
-systemctl --user start stagentapp stagentui >>"$LOG" 2>&1 || say "tray start returned nonzero (continuing)"
+# The daemon alone never steers: with no per-user agent registered it has no user
+# session ("Failed to get Active User Session ID") and builds no tunnel.
+systemctl --user start stagentapp stagentui >>"$LOG" 2>&1 || say "tray start nonzero"
 
-start=$(date +%s)
-fails=0
-snapped=0
+start=$(date +%s); fails=0; steering=0
 while :; do
   elapsed=$(( $(date +%s) - start ))
   [ "$elapsed" -ge "$HARD_TIMEOUT" ] && { say "hard timeout reached"; break; }
 
-  read -r dns tcp tls small big <<<"$(probe_round)"
-  say "t+${elapsed}s dns=$dns tcp=$tcp tls=$tls ping56=$small ping1372=$big"
+  read -r dns tcp tls tlsca icmp <<<"$(probe_round)"
+  sta=$($SW/ip -o link show sta0 2>/dev/null | wc -l)
+  say "t+${elapsed}s dns=$dns tcp=$tcp tls=$tls TLSca=$tlsca icmp=$icmp sta0=$sta"
 
-  if [ "$snapped" = 0 ] && { [ "$big" = 0 ] || [ "$tls" = 0 ] || [ "$dns" = 0 ]; }; then
-    snapped=1
-    say "FIRST DEGRADATION -- capturing state"
-    snapshot
+  if [ "$sta" = 1 ] && [ "$steering" = 0 ]; then
+    steering=1
+    say "STEERING ENGAGED"
+    say "  | sta0: $($SW/ip -o addr show sta0 2>/dev/null | tr '\n' ';' | cut -c1-200)"
+    say "  | ip rule: $($SW/ip rule list 2>/dev/null | tr '\n' ' ')"
+    say "  | table 9: $($SW/ip route show table 9 2>/dev/null | head -3 | tr '\n' ' ')"
+    say "  | rpfilter: $(asroot $SW/iptables -t mangle -S nixos-fw-rpfilter | tr '\n' ' ' | cut -c1-160)"
   fi
 
-  if [ "$((dns + tcp + tls))" = 0 ]; then
-    fails=$((fails + 1))
-    say "  ... dead round $fails/$FAIL_THRESHOLD"
-    [ "$fails" -ge "$FAIL_THRESHOLD" ] && { say "CONNECTIVITY LOST"; snapshot; break; }
+  if [ "$((dns + tcp))" = 0 ]; then
+    fails=$((fails + 1)); say "  ... dead round $fails/$FAIL_THRESHOLD"
+    [ "$fails" -ge "$FAIL_THRESHOLD" ] && { say "CONNECTIVITY LOST"; break; }
   else
     fails=0
   fi
   sleep 3
 done
 
-say "=== final state ==="
-snapshot
-say "log: $LOG"
+say "=== end; steering was $([ "$steering" = 1 ] && echo ENGAGED || echo NEVER-ENGAGED) ==="
 exit 0

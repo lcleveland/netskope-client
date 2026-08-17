@@ -1,11 +1,8 @@
 # NixOS VM test for the module logic (issue #9).
 #
-# SCAFFOLD — authored without Nix available, so it has NOT been run; treat as a
-# starting point to execute under #10 (`nix build .#checks.x86_64-linux.module`).
-#
-# It uses a stub package so the *module* (writable-state relocation, unit wiring)
-# can be exercised without the proprietary NSClient.run. It deliberately does not
-# configure enrollment (no secrets, no installerutil) or the tray.
+# It uses a stub package so the *module* (state relocation, the bind mount, unit
+# wiring) can be exercised without the proprietary NSClient.run. It deliberately does
+# not configure enrollment (no secrets, no installerutil) or the tray.
 { pkgs, self }:
 let
   # Minimal stand-in for the client: just enough shape for the module to
@@ -34,15 +31,41 @@ pkgs.testers.runNixOSTest {
   testScript = ''
     machine.wait_for_unit("netskope-setup.service")
 
-    # /opt/netskope/stagent is a real dir: shipped files are store symlinks...
-    machine.succeed("test -d /opt/netskope/stagent")
-    machine.succeed("test -L /opt/netskope/stagent/stAgentSvc")
-    # ...and the writable subdirs redirect to persistent state.
-    machine.succeed("test -d /var/lib/netskope/data")
-    machine.succeed("readlink /opt/netskope/stagent/data | grep -q '^/var/lib/netskope/data$'")
-    machine.succeed("readlink /opt/netskope/stagent/logs | grep -q '^/var/lib/netskope/logs$'")
+    # The client's IPC layer authenticates peers by resolving the connecting
+    # process's /proc/<pid>/exe against a hard-coded allowlist of
+    # /opt/netskope/stagent/{stAgentApp,stAgentCli,stAgentUI,nsdiag,bwansvc}, so the
+    # shipped files must be REAL FILES at that path. Symlinking them in from the
+    # store resolves to /nix/store and gets every peer rejected ("NSCOM2 invalid
+    # client connection"), which silently breaks the tray and stAgentCli while
+    # leaving the daemon itself looking healthy. Guard against that regression.
+    machine.succeed("test -f /opt/netskope/stagent/stAgentSvc")
+    machine.fail("test -L /opt/netskope/stagent/stAgentSvc")
+    machine.succeed(
+        'test "$(realpath /opt/netskope/stagent/stAgentSvc)" = /opt/netskope/stagent/stAgentSvc'
+    )
 
-    # The daemon starts against the materialised /opt path.
+    # That path is a bind mount of the state dir: it keeps the hard-coded location
+    # stable while leaving /opt itself disposable on a tmpfs root.
+    machine.succeed("mountpoint -q /opt/netskope/stagent")
+    machine.succeed("test -d /var/lib/netskope/app/data")
+    machine.succeed("test -d /var/lib/netskope/app/logs")
+
+    # Impermanence contract: state the client drops into its hard-coded directory has
+    # to land under statePath, the single directory a tmpfs-root host must persist.
+    machine.succeed("echo nsdeviceid=test > /opt/netskope/stagent/provisioning")
+    machine.succeed("grep -q nsdeviceid=test /var/lib/netskope/app/provisioning")
+
+    # data/ must stay traversable by the per-user stAgentUI/stAgentCli, which read
+    # data/nsusercert.p12 as the logged-in user (upstream install.sh uses mode 755).
+    machine.succeed('test "$(stat -c %a /var/lib/netskope/app/data)" = 755')
+
+    # Re-running setup, as a nixos-rebuild switch does, must neither stack bind
+    # mounts nor discard client state.
+    machine.succeed("systemctl restart netskope-setup.service")
+    machine.succeed("grep -q nsdeviceid=test /opt/netskope/stagent/provisioning")
+    machine.succeed('test "$(grep -c " /opt/netskope/stagent " /proc/mounts)" = 1')
+
+    # The daemon starts against the bind-mounted path.
     machine.wait_for_unit("stagentd.service")
     machine.succeed("systemctl is-active stagentd.service")
   '';

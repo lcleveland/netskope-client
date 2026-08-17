@@ -80,16 +80,33 @@ trap backout EXIT
 #   ping      -- unsteered control. Staying up while dns/tcp die means the *return
 #                path* is being dropped (hello, strict rpfilter), not the link.
 probe_round() {
-  local dns=0 tcp=0 tls=0 tlsca=0 icmp=0
+  local dns=0 tcp=0 tls=0 tlsca icmp=0
   timeout 3 getent hosts example.com >/dev/null 2>&1 && dns=1
   timeout 3 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>/dev/null && tcp=1
   timeout 6 curl -sS -o /dev/null https://example.com 2>/dev/null && tls=1
-  [ -r "$CERT" ] && timeout 6 curl -sS -o /dev/null --cacert "$CERT" https://example.com 2>/dev/null && tlsca=1
+  # "-" not 0 when the certificate cannot be read: statePath is typically 0700, so a
+  # non-root run cannot open it, and reporting 0 there reads as "not intercepted" when
+  # the probe simply never ran. That misreading cost real debugging time once.
+  if [ -r "$CERT" ]; then
+    tlsca=0
+    timeout 6 curl -sS -o /dev/null --cacert "$CERT" https://example.com 2>/dev/null && tlsca=1
+  else
+    tlsca="-"
+  fi
   timeout 3 ping -c1 -W2 1.1.1.1 >/dev/null 2>&1 && icmp=1
   echo "$dns $tcp $tls $tlsca $icmp"
 }
 
 say "log: $LOG"
+if [ -r "$CERT" ]; then
+  say "tenant CA readable ($CERT): TLSca probe active -- 1 means traffic really is"
+  say "  going through the tenant's gateway, which is the proof steering is carrying it"
+else
+  say "NOTE: cannot read $CERT, so the TLSca probe is skipped and reports '-'."
+  say "  Without it, connectivity holding up is NOT by itself proof that traffic is"
+  say "  being steered -- check the client log for 'Enable NS packet filter' too."
+  say "  Run as root, or: CERT=/path/to/readable/copy $0"
+fi
 say "=== baseline (steering off) ==="
 say "probe[dns tcp tls TLSca icmp]: $(probe_round)"
 

@@ -11,13 +11,19 @@ exposes it as a NixOS module. Planning and decisions are tracked as a
 > (`Successfully downloaded branding file by email id`). The VM test (`nix build
 > .#checks.x86_64-linux.module`) passes.
 >
-> Getting enrollment to work turned up four defects, all now fixed — see
+> Enrollment is verified on the host, not just in a sandbox: `netskope-enroll.service`
+> exits 0, the daemon picks the branding file up on its own retry timer without a
+> restart, and `stAgentCli show-config` reports the tenant gateway, organization and
+> steering config. Getting there turned up four defects, all now fixed — see
 > [Enrollment gotchas](#enrollment-gotchas). The big one is that the client's OpenSSL
 > **CApath of `/etc/ssl/certs` is unusable on NixOS**, so *every* TLS request it made
 > failed.
 >
-> Not yet verified: what happens after the branding file lands — the daemon's own
-> secure-enrollment (user cert) and traffic steering.
+> A fifth defect surfaced immediately after: the client installs the tenant CA into
+> the system trust store itself, and aborts its whole config cycle when that fails —
+> see [Tenant CA install](#tenant-ca-install).
+>
+> Not yet verified: traffic steering and the user certificate.
 
 ## Quick start
 
@@ -106,6 +112,37 @@ A useful way to reproduce enrollment without touching system state: copy the app
 into a tmpfs inside `unshare --mount --map-root-user`, bind it over
 `/opt/netskope/stagent`, and run `installerutil --download_branding_file '<envelope>'`
 there. Results land in `logs/nsInstallation.log`.
+
+## Tenant CA install
+
+Once enrolled, the daemon downloads the Netskope root and tenant CAs and installs them
+into the **system** trust store itself — and treats failure as fatal to the entire
+config update:
+
+```
+failed to open file for writing: /etc/pki/ca-trust/source/anchors/nscacert.crt, err: 2
+cert system ca cert is not installed
+Install CA failed, ca rotation status 2, 0
+config update failed, retry in 9 minutes
+```
+
+So enrollment succeeds and then the client never converges — it rolls the config back
+every nine minutes. `cert.cpp` picks its layout by probing for
+`/usr/sbin/update-ca-certificates` (Debian: write `/usr/local/share/ca-certificates`,
+then run that tool), falling back to the RHEL pair
+`/etc/pki/ca-trust/source/anchors` + `/usr/bin/update-ca-trust`. Neither exists here.
+
+`stagentd.service` therefore gets, **inside its own mount namespace only**: empty
+tmpfs mounts over `/usr` and `/etc/pki/ca-trust` (blanking `/usr` makes the layout
+choice ours rather than the host's), a writable anchors dir bound from
+`${statePath}/ca-anchors`, and a shim for `update-ca-trust` that succeeds without
+doing anything. Nothing new appears on the host — the VM test asserts that.
+
+The shim is a no-op on purpose: this system's trust store is built from
+`security.pki.certificateFiles` at activation, not from a mutable anchors dir, and
+trusting a MITM CA system-wide stays an explicit opt-in via `trustCA`. The useful
+side effect is that `${statePath}/ca-anchors/` is where the tenant CA lands in PEM
+form — which is what `caCertFile` needs, and the installer ships no CA.
 
 ## Options
 

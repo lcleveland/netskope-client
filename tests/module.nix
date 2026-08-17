@@ -68,5 +68,20 @@ pkgs.testers.runNixOSTest {
     # The daemon starts against the bind-mounted path.
     machine.wait_for_unit("stagentd.service")
     machine.succeed("systemctl is-active stagentd.service")
+
+    # The client verifies TLS peers with a compiled-in OpenSSL CApath of
+    # /etc/ssl/certs, and a CApath resolves anchors through <subject-hash>.<seq>
+    # symlinks that NixOS' /etc/ssl/certs does not have -- so without a rehashed
+    # directory bind-mounted in, every branding/config fetch fails with
+    # "self-signed certificate in certificate chain" (curl 60) and the client never
+    # enrolls. Check inside the daemon's own mount namespace, which is where
+    # BindReadOnlyPaths puts it.
+    pid = machine.succeed("systemctl show -p MainPID --value stagentd.service").strip()
+    machine.succeed(f"nsenter --mount --target {pid} find /etc/ssl/certs -name '*.0' | grep -q .")
+    # ... and the bundle files stay reachable: the mount is a superset of the real dir.
+    machine.succeed(f"nsenter --mount --target {pid} test -e /etc/ssl/certs/ca-bundle.crt")
+
+    # Namespacing the daemon must not hide the /opt bind mount it execs from.
+    machine.succeed(f"nsenter --mount --target {pid} mountpoint -q /opt/netskope/stagent")
   '';
 }

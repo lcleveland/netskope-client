@@ -22,6 +22,7 @@ pkgs.testers.runNixOSTest {
     {
       imports = [ self.nixosModules.default ];
       environment.systemPackages = [ pkgs.openssl ]; # to mint a stand-in tenant CA
+      services.resolved.enable = true; # the Private Access DNS fix acts on resolved
       services.netskope = {
         enable = true;
         enableTray = false; # daemon-only: no GTK/WebKit closure in the test
@@ -163,6 +164,33 @@ pkgs.testers.runNixOSTest {
         f"nsenter --mount --target {pid} "
         "grep -qFf /var/lib/netskope/ca-anchors/nstenantcert.crt /etc/ssl/certs/ca-bundle.crt"
     )
+
+    # Private Access names are commonly published under `.local`, which
+    # systemd-resolved refuses to send to unicast DNS at all -- so the query dies
+    # inside resolved and never reaches the client, which would have answered it.
+    # The routing domain goes on the tunnel interface, which the client creates when
+    # the tunnel comes up; stand in a dummy device of that name.
+    machine.succeed("ip link add sta0 type dummy && ip link set sta0 up")
+    # The VM's link has no DNS of its own; give it one, since copying the
+    # default-route link's servers onto the tunnel is half of what the unit does.
+    # (With none, the unit correctly declines to touch anything -- also worth having
+    # exercised, which the run before this assertion does.)
+    link = machine.succeed("ip -o route show default | awk '{print $5; exit}'").strip()
+    machine.succeed(f"resolvectl dns {link} 192.0.2.53")
+    machine.wait_until_succeeds("systemctl restart netskope-npa-dns.service")
+    machine.succeed("resolvectl domain sta0 | grep -q '~local'")
+    # ...pointed at the DNS servers of the default-route link, because the client only
+    # answers queries aimed at the system's own resolver.
+    machine.succeed("resolvectl dns sta0 | grep -qE '[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+'")
+    # ...and without disturbing the link NetworkManager (or whatever) manages, since
+    # reverting a managed link wipes the DNS servers it pushed.
+    machine.succeed(f"resolvectl domain {link} | grep -qv '~local'")
+    machine.succeed(f"resolvectl dns {link} | grep -q 192.0.2.53")
+
+    # Removing the tunnel takes the routing domain with it, rather than leaving
+    # resolved pointing `.local` at an interface that no longer exists.
+    machine.succeed("ip link del sta0")
+    machine.wait_until_fails("systemctl is-active --quiet netskope-npa-dns.service")
 
     # Strict reverse-path filtering DROPs every steered reply (they arrive on the tun
     # while the route to their source is via the physical link), which takes the whole

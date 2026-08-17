@@ -73,6 +73,28 @@ let
     ln -s ${config.systemd.package}/bin/resolvectl $out/resolvectl
   '';
 
+  # Which trust store the client's own units get.
+  #
+  # Normally the build-time one above is right. But with trustCA on and steering
+  # live, the client's OWN traffic is intercepted and re-signed by the tenant too --
+  # it is not exempt from its own SSL inspection:
+  #
+  #   tunnel.cpp:1296  TLS Tunneling flow ... process: stagentsvc
+  #                    to host: achecker-<tenant>.goskope.com
+  #   nsHTTPClient.cpp:512  curl_easy_perform failed, code 60,
+  #                    SSL peer certificate or SSH remote key was not OK
+  #
+  # achecker is the Private Access access-checker, so a daemon that cannot verify it
+  # cannot resolve private apps: they come back SERVFAIL while everything else looks
+  # healthy. Measured on a real host -- the daemon's private bundle had 121
+  # certificates and no tenant CA, while the system had 123 with it.
+  #
+  # So when trustCA is on, point the daemon at the same runtime trust dir as the rest
+  # of the machine (netskope-ca-trust.service builds it, and orders itself before
+  # stagentd so it exists first). It carries the hashed layout the client's CApath
+  # needs, and it follows CA rotation.
+  clientCertDir = if cfg.trustCA then "${cfg.statePath}/ca-trust" else caCertDir;
+
   # Stand-in for the distro tool that rebuilds the system trust store from its
   # anchors directory -- see the CA-install notes on stagentd.service below.
   caTrustShim = pkgs.writeShellScript "netskope-update-ca-trust" ''
@@ -444,7 +466,13 @@ in
       wantedBy = [ "multi-user.target" ];
       requires = [ "netskope-setup.service" ];
       after = [ "netskope-setup.service" ];
-      before = [ "stagentd.service" ];
+      # Both client units bind ${statePath}/ca-trust as their /etc/ssl/certs when
+      # trustCA is on (see clientCertDir), and a bind of a directory that does not
+      # exist yet fails the unit outright -- so this has to have run first.
+      before = [
+        "stagentd.service"
+        "netskope-enroll.service"
+      ];
       unitConfig.RequiresMountsFor = cfg.statePath;
       path = [ pkgs.util-linux ];
       # No RemainAfterExit: the unit must be able to run again when the path unit
@@ -620,11 +648,12 @@ in
     systemd.services.netskope-enroll = lib.mkIf enrollmentConfigured {
       description = "Enroll the Netskope client with the ${cfg.tenantHost} tenant";
       wantedBy = [ "multi-user.target" ];
-      requires = [ "netskope-setup.service" ];
+      requires = [ "netskope-setup.service" ] ++ lib.optional cfg.trustCA "netskope-ca-trust.service";
       after = [
         "netskope-setup.service"
         "network-online.target"
-      ];
+      ]
+      ++ lib.optional cfg.trustCA "netskope-ca-trust.service";
       wants = [ "network-online.target" ];
       before = [ "stagentd.service" ];
       serviceConfig = {
@@ -637,7 +666,7 @@ in
         # Without this every request the client makes fails TLS verification -- see
         # caCertDir above for why NixOS' /etc/ssl/certs is unusable as an OpenSSL
         # CApath.
-        BindReadOnlyPaths = [ "${caCertDir}:/etc/ssl/certs" ];
+        BindReadOnlyPaths = [ "${clientCertDir}:/etc/ssl/certs" ];
         LoadCredential = [
           "orgkey:${enr.orgKeyFile}"
         ]
@@ -709,11 +738,12 @@ in
       # and netskope-enroll still run at boot -- they only materialise /opt and
       # fetch branding, and `systemctl start stagentd` pulls setup in anyway.
       wantedBy = lib.optional cfg.autoStart "multi-user.target";
-      requires = [ "netskope-setup.service" ];
+      requires = [ "netskope-setup.service" ] ++ lib.optional cfg.trustCA "netskope-ca-trust.service";
       after = [
         "network-online.target"
         "netskope-setup.service"
       ]
+      ++ lib.optional cfg.trustCA "netskope-ca-trust.service"
       ++ lib.optional enrollmentConfigured "netskope-enroll.service";
       wants = [ "network-online.target" ] ++ lib.optional enrollmentConfigured "netskope-enroll.service";
       # The client uses BOTH lookup mechanisms, so it needs both halves. Its net
@@ -782,7 +812,7 @@ in
         #
         #    -- and stAgentCli reports only "Internet Security disabled due to error".
         BindReadOnlyPaths = [
-          "${caCertDir}:/etc/ssl/certs"
+          "${clientCertDir}:/etc/ssl/certs"
           "${caTrustShim}:/usr/bin/update-ca-trust"
           "${fhsTools}:/usr/sbin"
         ];

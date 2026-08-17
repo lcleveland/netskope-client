@@ -113,22 +113,21 @@ stdenv.mkDerivation {
     gnutar
   ];
 
-  buildInputs =
-    [
-      stdenv.cc.cc.lib # libstdc++.so.6, libgcc_s.so.1 (all binaries)
-      nss # certutil
-      nspr # certutil
-    ]
-    ++ lib.optionals enableTray [
-      gtk3
-      webkitgtk_4_1
-      libayatana-appindicator
-      glib
-      pango
-      cairo
-      gdk-pixbuf
-      dbus
-    ];
+  buildInputs = [
+    stdenv.cc.cc.lib # libstdc++.so.6, libgcc_s.so.1 (all binaries)
+    nss # certutil
+    nspr # certutil
+  ]
+  ++ lib.optionals enableTray [
+    gtk3
+    webkitgtk_4_1
+    libayatana-appindicator
+    glib
+    pango
+    cairo
+    gdk-pixbuf
+    dbus
+  ];
 
   # NSClient.run is a Makeself self-extracting archive: an N-line /bin/sh header
   # followed by a gzip'd tar. `--noexec` hangs, so carve the payload out using the
@@ -152,21 +151,20 @@ stdenv.mkDerivation {
   dontConfigure = true;
   dontBuild = true;
 
-  installPhase =
-    ''
-      runHook preInstall
+  installPhase = ''
+    runHook preInstall
 
-      dest="$out/opt/netskope/stagent"
-      mkdir -p "$dest"
-      cp -a payload/. "$dest/"
-    ''
-    + lib.optionalString (!enableTray) ''
-      # daemon-only: drop the GTK/WebKit tray binary so autoPatchelf doesn't demand its libs
-      rm -f "$dest/stAgentUI"
-    ''
-    + ''
-      runHook postInstall
-    '';
+    dest="$out/opt/netskope/stagent"
+    mkdir -p "$dest"
+    cp -a payload/. "$dest/"
+  ''
+  + lib.optionalString (!enableTray) ''
+    # daemon-only: drop the GTK/WebKit tray binary so autoPatchelf doesn't demand its libs
+    rm -f "$dest/stAgentUI"
+  ''
+  + ''
+    runHook postInstall
+  '';
 
   # stAgentUI hard-codes stale sonames; rewrite them to current nixpkgs libs BEFORE
   # autoPatchelf (postFixup) resolves NEEDED entries against buildInputs.

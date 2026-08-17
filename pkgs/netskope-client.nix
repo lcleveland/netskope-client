@@ -25,17 +25,27 @@
   tenant ? null, # short tenant name -> fetch from download-<tenant>.goskope.com (no auth)
   hash ? null, # hash of the fetched NSClient.run (required with tenant/url)
   url ? null, # explicit installer URL override (mirror); requires hash
-  src ? null, # explicit src override (path/derivation); wins over everything
+  # Explicit source override (path/derivation); wins over everything.
+  #
+  # Deliberately NOT named `src`: callPackage auto-fills any argument whose name
+  # exists in the package set -- including ones that have a default here -- and
+  # nixpkgs carries a *throwing* `pkgs.src` rename alias ("The \"src\" package has
+  # been renamed to \"simple-revision-control\"", aliases.nix, added 2025-11-19).
+  # With the argument named `src`, every plain `pkgs.callPackage` of this file (the
+  # module's `package` default, and this flake's own package output) resolved it to
+  # that alias and aborted evaluation as soon as the source was forced. The name
+  # `srcOverride` collides with nothing in the package set, so the default holds.
+  srcOverride ? null,
 }:
 
 let
   version = "140.0.2.2763";
 
   # Client source resolution, in priority order:
-  #   1. explicit `src`       (path/derivation)
-  #   2. `url` + `hash`       (fetchurl from a mirror)
-  #   3. `tenant` + `hash`    (fetchurl from download-<tenant>.goskope.com; public, no auth)
-  #   4. requireFile fallback (offline: `nix-store --add-fixed sha256 NSClient.run`)
+  #   1. explicit `srcOverride` (path/derivation)
+  #   2. `url` + `hash`         (fetchurl from a mirror)
+  #   3. `tenant` + `hash`      (fetchurl from download-<tenant>.goskope.com; public, no auth)
+  #   4. requireFile fallback   (offline: `nix-store --add-fixed sha256 NSClient.run`)
   #
   # The download URL is public (verified: no auth), but the file is proprietary and
   # rebuilt per tenant/version, so its hash is not universal -- the user pins `hash`
@@ -83,8 +93,8 @@ let
   };
 
   resolvedSrc =
-    if src != null then
-      src
+    if srcOverride != null then
+      srcOverride
     else if fetchedSrc != null then
       fetchedSrc
     else

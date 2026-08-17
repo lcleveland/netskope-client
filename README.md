@@ -48,7 +48,9 @@ nix store prefetch-file --name NSClient.run \
 
 Alternatives: `sourceUrl` (an internal mirror) + `hash`; or offline via `requireFile`
 (`nix-store --add-fixed sha256 NSClient.run`) or
-`package = pkgs.netskope-client.override { src = ./NSClient.run; }`.
+`package = pkgs.netskope-client.override { srcOverride = ./NSClient.run; }`
+(the argument is `srcOverride` rather than `src` so that `callPackage` cannot
+auto-fill it from nixpkgs' throwing `pkgs.src` rename alias).
 The installer is **proprietary and non-redistributable** — don't commit it.
 
 ## Secrets

@@ -23,9 +23,10 @@ exposes it as a NixOS module. Planning and decisions are tracked as a
 > the system trust store itself, and aborts its whole config cycle when that fails —
 > see [Tenant CA install](#tenant-ca-install).
 >
-> A sixth: steering needs `ip` (iproute2) on the daemon's PATH, and its absence is
-> silent — the tunnel connects, then the filter device fails to start and the client
-> reports `Internet Security disabled due to error` while looking healthy.
+> A sixth: steering needs `ip`, which the client looks for at `/usr/sbin/ip` and
+> nowhere else — not on `PATH`. Its absence is silent: the tunnel connects, then the
+> filter device fails to start and the client reports `Internet Security disabled due
+> to error` while looking healthy.
 >
 > Not yet verified: that steering actually carries traffic once the filter device
 > starts, and the user certificate.
@@ -151,10 +152,17 @@ form — which is what `caCertFile` needs, and the installer ships no CA.
 
 ## Runtime tools
 
-The daemon shells out to a handful of commands and resolves them through `PATH`, so
-`systemd.services.stagentd.path` is enough — no FHS shims needed. It wants `iptables`,
-`ip6tables`, `ip` and `dmidecode`; everything else it probes for (`dpkg`, `rpm`,
-`realm`, `pgrep`, `traceroute`, …) goes unused in this configuration.
+The daemon shells out to a handful of commands and looks for them at **`/usr/sbin/<name>`**
+— *not* through `PATH`. `systemd.services.stagentd.path` therefore does nothing for it;
+the commands are bound into `/usr/sbin` inside the unit's namespace instead (`fhsTools`).
+That took some proving: with `iproute2` on the unit's PATH the daemon still logged
+`Command ip not found!`, and it still did with `/usr/bin/ip` in place. Only `/usr/sbin/ip`
+silenced it.
+
+It wants `ip`, `iptables`, `ip6tables`, `dmidecode` and `resolvectl`; everything else in
+its string table (`dpkg`, `rpm`, `realm`, `pgrep`, `traceroute`, …) goes unused here.
+One name is deliberately *withheld*: `update-ca-certificates`, whose presence would
+send the CA installer down its Debian branch (see [Tenant CA install](#tenant-ca-install)).
 
 `ip` is the one that matters, and losing it fails in a way that is easy to misread:
 

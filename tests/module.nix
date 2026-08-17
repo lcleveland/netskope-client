@@ -97,10 +97,13 @@ pkgs.testers.runNixOSTest {
     machine.succeed(f"nsenter --mount --target {pid} /usr/bin/update-ca-trust")
     machine.fail(f"nsenter --mount --target {pid} test -e /usr/sbin/update-ca-certificates")
 
-    # Steering needs `ip` on the daemon's PATH: without it the tunnel connects and
-    # then the filter device fails to start, leaving the client "healthy" but not
-    # steering a packet. Cheap regression guard, since the stub cannot exercise it.
-    machine.succeed("systemctl show -p Environment stagentd.service | grep -q iproute2")
+    # Steering needs `ip`, and the client looks for it at /usr/sbin/ip specifically --
+    # not on PATH, which is why systemd.services.*.path does not help. Without it the
+    # tunnel connects and only then does the filter device fail, leaving a daemon that
+    # looks healthy while steering nothing.
+    for tool in ["ip", "iptables", "ip6tables", "dmidecode", "resolvectl"]:
+        machine.succeed(f"nsenter --mount --target {pid} test -x /usr/sbin/{tool}")
+    machine.succeed(f"nsenter --mount --target {pid} /usr/sbin/ip -V")
 
     # None of that may leak onto the host: these paths exist only in the namespace.
     machine.fail("test -e /usr/bin/update-ca-trust")

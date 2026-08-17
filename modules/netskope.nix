@@ -517,6 +517,73 @@ in
       '';
     };
 
+    # Private Access name resolution.
+    #
+    # The client resolves private apps itself, handing back a synthetic 100.64.0.0/10
+    # address -- verified against a live tenant, where an A query for a private app
+    # aimed at the system resolver returns 100.64.0.1. Browsers still get nothing,
+    # because private apps are commonly published under `.local` and systemd-resolved
+    # refuses to send `.local` to unicast DNS at all (RFC 6762 reserves it for mDNS):
+    #
+    #   resolve call failed: No appropriate name servers or networks for name found
+    #
+    # The query dies inside resolved and never reaches the client. Fix it by giving
+    # the client's own tunnel interface a routing domain for `local`, plus the DNS
+    # servers of the default-route link -- the client only answers queries aimed at
+    # the system's resolver, so the same query sent to a public resolver comes back
+    # as a real NXDOMAIN.
+    #
+    # Four things here were settled by testing on a real host rather than reasoned:
+    #
+    #  * A GLOBAL routing domain (services.resolved.domains) does NOT work: global
+    #    domains route to global DNS servers, and a DHCP-configured host has none.
+    #  * `local` as a whole is the right scope. It needs no tenant knowledge, and the
+    #    domain list could not be discovered anyway -- the client keeps it encrypted.
+    #  * mDNS keeps working. nss-mdns only claims SINGLE-label `.local` names, so
+    #    `somehost.local` still resolves through Avahi ahead of resolved, while
+    #    multi-label corporate names fall through to us.
+    #  * This belongs on sta0, not on the physical link. Touching an
+    #    NetworkManager-managed link risks `resolvectl revert` wiping the DNS servers
+    #    NM pushed (recoverable only by reactivating the connection), whereas sta0 is
+    #    created and destroyed by the client, so the routing domain naturally lives
+    #    exactly as long as the tunnel does.
+    #
+    # NB: the client rejects AAAA queries for these names ("Unsupported DNS Flags"),
+    # which is its own quirk and not fatal -- resolved uses the A answer.
+    systemd.services.netskope-npa-dns = {
+      description = "Route .local names to the Netskope tunnel resolver";
+      # sta0 exists only while the tunnel is up, which is exactly when this should
+      # apply, so bind to the device rather than guessing at timing.
+      bindsTo = [ "sys-subsystem-net-devices-sta0.device" ];
+      after = [ "sys-subsystem-net-devices-sta0.device" ];
+      wantedBy = [ "sys-subsystem-net-devices-sta0.device" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+      };
+      script = ''
+        set -eu
+        resolvectl=${config.systemd.package}/bin/resolvectl
+
+        link="$(${pkgs.iproute2}/bin/ip -o route show default | ${pkgs.gawk}/bin/awk '{print $5; exit}')"
+        if [ -z "$link" ]; then
+          echo "netskope: no default route; leaving Private Access DNS alone" >&2
+          exit 0
+        fi
+        servers="$("$resolvectl" dns "$link" | ${pkgs.gnused}/bin/sed 's/^[^:]*: *//')"
+        if [ -z "$servers" ]; then
+          echo "netskope: $link has no DNS servers; leaving Private Access DNS alone" >&2
+          exit 0
+        fi
+
+        # Unquoted on purpose: resolvectl takes the servers as separate arguments.
+        # shellcheck disable=SC2086
+        "$resolvectl" dns sta0 $servers
+        "$resolvectl" domain sta0 '~local'
+        echo "netskope: .local routed via sta0 -> $servers" >&2
+      '';
+    };
+
     # The client rewrites its anchors when the tenant rotates its CA. Rebuild then,
     # rather than only at boot; the mount picks the new contents up in place.
     systemd.paths.netskope-ca-trust = lib.mkIf cfg.trustCA {

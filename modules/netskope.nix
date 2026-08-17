@@ -175,24 +175,43 @@ in
       type = lib.types.bool;
       default = false;
       description = ''
-        Add the Netskope SSL-inspection root CA to the system trust store.
-        This is a MITM certificate, so opt in deliberately. Requires `caCertFile`.
+        Trust the tenant's SSL-inspection CA system-wide, so that browsers, curl, git
+        and everything else keep working once steering is live. This is a MITM
+        certificate, so it is opt-in and deliberately off by default.
+
+        No certificate file is required. The enrolled client fetches its tenant CA at
+        runtime and writes it to `''${statePath}/ca-anchors/`, and this option makes
+        the system trust whatever it finds there -- so it follows CA rotation on its
+        own, and nobody has to commit a tenant certificate to their configuration.
+
+        The mechanism is a bind mount over /etc/ssl/certs, because a NixOS trust store
+        is assembled at build time from `security.pki.certificateFiles` and a file the
+        client only fetches at runtime can never feed it. See netskope-ca-trust.service.
+
+        `caCertFile` remains available for the case where you do have the certificate
+        at evaluation time and would rather bake it in.
       '';
     };
 
     caCertFile = lib.mkOption {
       type = lib.types.nullOr lib.types.path;
       default = null;
-      example = "/etc/netskope/nstenantcert.crt";
+      example = lib.literalExpression "./nstenantcert.crt";
       description = ''
-        Path to the Netskope root CA (PEM) used for SSL inspection. The installer
-        does NOT ship it, so it cannot be derived from the package -- but an
-        enrolled client downloads it and writes it out in PEM form, so the simplest
-        source is this host itself: once the daemon has run a config update, look in
-        `''${statePath}/ca-anchors/` for `nstenantcert.crt` (SSL inspection) and
-        `nscacert.crt` (the Netskope root). Failing that, take it from the tenant
-        admin console. (The client's own encrypted copies live in
-        `''${statePath}/app/data/*.pem.enc` and are not directly usable.)
+        Optional: a Netskope CA (PEM) to bake into the system trust store at build
+        time, in addition to whatever `trustCA` picks up at runtime.
+
+        You do not need this. `trustCA` alone trusts the certificate the client itself
+        downloads, which is the only copy most hosts will ever have. Set this only if
+        you want the CA trusted before the client has ever enrolled, or you would
+        rather pin it declaratively -- and note it must be readable at *evaluation*
+        time, so under flakes it has to live inside the flake.
+
+        To obtain a copy for that purpose: an enrolled host has it at
+        `''${statePath}/ca-anchors/nstenantcert.crt` (SSL inspection) and
+        `nscacert.crt` (the Netskope root); otherwise the tenant admin console. The
+        client's own encrypted copies under `''${statePath}/app/data/*.pem.enc` are
+        not directly usable.
       '';
     };
 
@@ -333,10 +352,6 @@ in
         message = "services.netskope: Netskope ships no Linux client for ${pkgs.stdenv.hostPlatform.system} (x86_64-linux only).";
       }
       {
-        assertion = cfg.trustCA -> cfg.caCertFile != null;
-        message = "services.netskope.trustCA is enabled but services.netskope.caCertFile is unset — supply the Netskope root CA PEM (the installer does not ship it).";
-      }
-      {
         assertion = (enr.orgKeyFile != null) -> (cfg.tenantHost != "");
         message = "services.netskope.enrollment.orgKeyFile is set but services.netskope.tenantHost is empty — set the tenant host.";
       }
@@ -375,10 +390,10 @@ in
           ''
       ++ lib.optional (cfg.enable && !cfg.trustCA) ''
         services.netskope.trustCA is off. Once steering is live the tenant re-signs every
-        HTTPS connection with its own CA, so anything using the system trust store will fail
-        with "self-signed certificate in certificate chain" until that CA is trusted. An
-        enrolled client writes it to ''${cfg.statePath}/ca-anchors/nstenantcert.crt -- point
-        services.netskope.caCertFile at a copy and set trustCA = true.
+        HTTPS connection with its own CA, so browsers, curl and git will fail with
+        "self-signed certificate in certificate chain" until that CA is trusted. Setting
+        trustCA = true is enough -- it trusts the certificate the client downloads for
+        itself, with no certificate file to supply.
       '';
 
     environment.systemPackages = [
@@ -397,10 +412,93 @@ in
       ''
     );
 
-    # Netskope's SSL inspection MITMs TLS, so its root CA must be trusted
-    # system-wide (issue #8). The installer does not ship the cert, so the user
-    # supplies it via caCertFile; it is added at build time to the system bundle.
-    security.pki.certificateFiles = lib.mkIf (cfg.trustCA && cfg.caCertFile != null) [ cfg.caCertFile ];
+    # Optional build-time half of CA trust: only when someone has the certificate at
+    # evaluation time and wants it pinned. The runtime half below is what actually
+    # makes `trustCA` work for everyone else.
+    security.pki.certificateFiles = lib.mkIf (cfg.caCertFile != null) [ cfg.caCertFile ];
+
+    # Runtime CA trust (issue #8), the half that does not need a certificate in your
+    # configuration.
+    #
+    # Netskope's SSL inspection re-signs every HTTPS connection once steering is live
+    # -- verified against a live tenant: the issuer becomes
+    # CN=ns-swg.ca.<tenant>.goskope.com, curl against the system trust store fails
+    # with "self-signed certificate in certificate chain" (60), and the same request
+    # with the tenant CA returns 200. So without this the client works and the rest of
+    # the desktop does not.
+    #
+    # The awkward part is that a NixOS trust store is assembled at BUILD time, from
+    # security.pki.certificateFiles, while the only copy of the tenant CA most hosts
+    # will ever have is fetched by the client at RUNTIME (it lands in
+    # ''${statePath}/ca-anchors -- see stagentd.service). A runtime file cannot feed a
+    # build-time bundle, and under flakes it cannot even be read at eval ("access to
+    # absolute path ... is forbidden in pure evaluation mode"). Requiring every user to
+    # copy their tenant's certificate into their own configuration is not a solution.
+    #
+    # So: assemble the bundle at runtime -- the system's own CA bundle plus whatever
+    # the client has fetched -- and bind-mount it over /etc/ssl/certs. That follows CA
+    # rotation for free, since the client rewrites the anchors and this unit is
+    # retriggered by a path unit when it does.
+    systemd.services.netskope-ca-trust = lib.mkIf cfg.trustCA {
+      description = "Trust the Netskope tenant CA system-wide";
+      wantedBy = [ "multi-user.target" ];
+      requires = [ "netskope-setup.service" ];
+      after = [ "netskope-setup.service" ];
+      before = [ "stagentd.service" ];
+      unitConfig.RequiresMountsFor = cfg.statePath;
+      path = [ pkgs.util-linux ];
+      # No RemainAfterExit: the unit must be able to run again when the path unit
+      # below fires on a CA rotation, and the bind mount outlives the process anyway.
+      serviceConfig.Type = "oneshot";
+      script = ''
+        set -eu
+        dir="${cfg.statePath}/ca-trust"
+        install -d -m 0755 "$dir"
+
+        # Start from the system bundle, then append the client's anchors. Written to a
+        # temporary name and moved into place so nothing ever observes a half-written
+        # trust store -- this directory is /etc/ssl/certs for the whole machine.
+        : > "$dir/.bundle.tmp"
+        cat ${config.security.pki.caBundle} >> "$dir/.bundle.tmp"
+        for f in "${cfg.statePath}"/ca-anchors/*.crt; do
+          [ -e "$f" ] || continue   # nothing fetched yet: bundle == system bundle
+          printf '\n' >> "$dir/.bundle.tmp"
+          cat "$f" >> "$dir/.bundle.tmp"
+        done
+        chmod 0644 "$dir/.bundle.tmp"
+        cp "$dir/.bundle.tmp" "$dir/.certificates.tmp"
+        mv -f "$dir/.bundle.tmp" "$dir/ca-bundle.crt"
+        mv -f "$dir/.certificates.tmp" "$dir/ca-certificates.crt"
+
+        # Also provide the hashed layout, for anything using this as an OpenSSL CApath
+        # rather than a CAfile -- the Netskope client itself is one such consumer.
+        rm -f "$dir"/*.pem "$dir"/*.0
+        ${pkgs.gawk}/bin/awk -v d="$dir" '
+          /-----BEGIN CERTIFICATE-----/ { n++; f = sprintf("%s/ca-%04d.pem", d, n) }
+          f { print > f }
+          /-----END CERTIFICATE-----/ { f = "" }' "$dir/ca-bundle.crt"
+        # stderr too: rehash warns about the two bundle files, which hold many certs
+        # each and are meant to be skipped. Not worth a warning on every boot.
+        ${pkgs.openssl.bin}/bin/openssl rehash "$dir" >/dev/null 2>&1
+
+        # Mount last, and only once: if generation failed above, set -e means we never
+        # get here and /etc/ssl/certs is left alone rather than replaced with rubble.
+        if ! mountpoint -q /etc/ssl/certs; then
+          mount --bind "$dir" /etc/ssl/certs
+        fi
+      '';
+    };
+
+    # The client rewrites its anchors when the tenant rotates its CA. Rebuild then,
+    # rather than only at boot; the mount picks the new contents up in place.
+    systemd.paths.netskope-ca-trust = lib.mkIf cfg.trustCA {
+      description = "Watch for Netskope tenant CA rotation";
+      wantedBy = [ "multi-user.target" ];
+      pathConfig = {
+        PathChanged = "${cfg.statePath}/ca-anchors";
+        Unit = "netskope-ca-trust.service";
+      };
+    };
 
     # NixOS' reverse-path filter has to be loosened or steering takes the whole
     # network down with it.

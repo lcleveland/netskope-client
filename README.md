@@ -35,8 +35,14 @@ exposes it as a NixOS module. Planning and decisions are tracked as a
 > Measured on a real host: with that one change, 90s of live steering with DNS and TCP
 > up throughout and traffic verifiably flowing through the tenant's gateway.
 >
-> What remains is only `trustCA`: under steering the tenant re-signs every HTTPS
-> connection, so anything on the system trust store fails until its CA is trusted.
+> Under steering the tenant re-signs every HTTPS connection, so the system trust store
+> has to accept its CA. `trustCA = true` handles that **without any certificate in your
+> configuration** — it trusts the copy the client downloads for itself, and follows CA
+> rotation. See [Trusting the tenant CA](#trusting-the-tenant-ca--without-putting-it-in-your-config).
+>
+> Not yet verified on a host: that combination in one run. The rpfilter fix and the
+> steering behaviour above are measured; runtime CA trust is covered by the VM test but
+> has not yet been through a live steering session.
 
 ## Quick start
 
@@ -59,8 +65,9 @@ exposes it as a NixOS module. Planning and decisions are tracked as a
       email         = "user@example.com";                # required (or `upn`) — see below
     };
 
+    # Trust the tenant's SSL-inspection CA so HTTPS keeps working under steering.
+    # No certificate file needed: it uses the copy the client downloads for itself.
     trustCA = true;
-    caCertFile = "/etc/netskope/nstenantcert.crt";
   };
 }
 ```
@@ -227,7 +234,7 @@ Unsteered ICMP surviving while steered TCP/DNS died is the fingerprint: it is th
 steering it carries `100.65.0.2/16`, and table 9 holds `default dev sta0` plus
 per-destination bypasses for the corporate ranges.
 
-### What is left: `trustCA`
+### Trusting the tenant CA — without putting it in your config
 
 With steering live the tenant re-signs every HTTPS connection:
 
@@ -237,10 +244,37 @@ curl (system trust):  (60) self-signed certificate in certificate chain
 curl --cacert <tenant CA>: 200
 ```
 
-So until the tenant CA is in the system trust store, HTTPS fails everywhere. Set
-`trustCA = true` and point `caCertFile` at the cert the enrolled client wrote to
-`${statePath}/ca-anchors/nstenantcert.crt`. The module warns when steering can run
-without it.
+So until the tenant CA is trusted, HTTPS fails everywhere — the client works, the rest
+of the desktop does not. `trustCA = true` is the whole fix; **no certificate file is
+required**.
+
+That takes some doing, because the two halves don't line up: a NixOS trust store is
+assembled at **build** time from `security.pki.certificateFiles`, while the only copy
+of the tenant CA most hosts will ever have is fetched by the client at **runtime**. A
+runtime file cannot feed a build-time bundle, and under flakes it cannot even be read
+at eval:
+
+```
+error: access to absolute path '/var/lib/netskope/ca-anchors/nstenantcert.crt'
+       is forbidden in pure evaluation mode
+```
+
+Making every user copy their tenant's certificate into their own configuration is not
+a solution — it is per-user manual work that also goes stale the moment the tenant
+rotates its CA.
+
+So `netskope-ca-trust.service` assembles the bundle at runtime — the system's own CA
+bundle plus whatever the client has fetched into `${statePath}/ca-anchors` — writes
+both the bundle and the hashed CApath layout, and bind-mounts the result over
+`/etc/ssl/certs`. A `systemd.path` unit watching the anchors directory rebuilds it when
+the tenant rotates, so rotation is handled without anyone editing anything.
+
+Before the client has fetched anything the mount is exactly the system trust store, so
+it is inert rather than dangerous. `caCertFile` still exists for anyone who does have
+the certificate at eval time and would rather pin it.
+
+This is opt-in and off by default: it trusts a MITM CA system-wide, which should be a
+deliberate act.
 
 ### Testing steering safely
 
@@ -269,7 +303,8 @@ Even then the client cleans up nothing when killed, so the harness removes the
 | `enableTray` (default `true`) | tray UI: `stagentapp` (watchdog) + `stagentui` (icon) user services + launcher entry |
 | `tenantHost` | tenant hostname, **not** the addon host (defaults to `<tenant>.goskope.com`) |
 | `enrollment.{orgKeyFile,authTokenFile,encryptTokenFile,email,upn}` | enrollment params |
-| `trustCA` / `caCertFile` | add the Netskope root CA to system trust |
+| `trustCA` | trust the tenant CA system-wide, from the client's own runtime copy |
+| `caCertFile` | optional: pin a CA at build time instead (must be in the flake) |
 | `autoStart` (default `true`) | start the daemon at boot; false = start it by hand |
 | `autoUpdate` (default `false`) | client self-update — unsupported on Nix |
 

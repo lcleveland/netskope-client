@@ -28,12 +28,15 @@ exposes it as a NixOS module. Planning and decisions are tracked as a
 > filter device fails to start and the client reports `Internet Security disabled due
 > to error` while looking healthy.
 >
-> **Steering starts, and then breaks connectivity.** With the tools in place the
-> client brings its filter device up (`Enable NS packet filter for web mode`, ports
-> 80/443, tunnel up) — and from that moment name resolution fails, sockets time out,
-> and eventually the client's own control traffic times out and the tunnel drops.
-> Unresolved; see [Steering](#steering) for what is known. `autoStart = false` exists
-> so you can investigate this without a machine that needs a reboot to recover.
+> **Steering works**, and the reason it did not is NixOS-specific: the default
+> **strict reverse-path filter DROPs every steered reply**, taking the whole network
+> down within ~27s of the tunnel coming up. The module now defaults
+> `networking.firewall.checkReversePath` to `"loose"` — see [Steering](#steering).
+> Measured on a real host: with that one change, 90s of live steering with DNS and TCP
+> up throughout and traffic verifiably flowing through the tenant's gateway.
+>
+> What remains is only `trustCA`: under steering the tenant re-signs every HTTPS
+> connection, so anything on the system trust store fails until its CA is trusted.
 
 ## Quick start
 
@@ -186,76 +189,74 @@ missing `ip` shows up as `Failed to get MTU on device = `.
 
 ## Steering
 
-**Status: gets as far as breaking your network.** Once the client can find its tools
-it brings the filter device up properly — interface detected, TUN device opened, IP
-exceptions for RFC1918 installed, `Enable NS packet filter for web mode`, `Tunnel Up`.
-Then connectivity degrades: sockets time out, name resolution fails, and after a few
-minutes the client's own control traffic times out too (`curl code 28`, `GSLB fetch
-failed`) and the tunnel drops with `Tunnel down due to error`.
+**Status: works.** The blocker was NixOS' reverse-path filter, and it is the single
+nastiest failure in this whole exercise: connectivity dies ~25s *after* the client
+reports everything healthy, and stays dead until the daemon is killed.
 
-What is ruled out: the egress interface *is* detected (`physical interface: wlp2s0`,
-MTU 1500), the tunnel *does* establish to the POP with an assigned IP, and the host
-firewall is iptables-backed (`networking.nftables.enable = false`), so the client's
-mangle rules and NixOS' filter rules are not on different backends.
-
-### What the failure actually is
-
-Measured with `tools/steering-test.sh`, which probes each protocol separately while
-steering is live. The signature is not "the network is down":
+`networking.firewall.checkReversePath` defaults to `true` on NixOS, which installs a
+**strict** filter ending in `DROP`, in mangle `PREROUTING`:
 
 ```
-t+16s  dns=1 tcp=1 tls=1 ping56=1 ping1372=1     <- before steering engages
-t+33s  dns=1 tcp=0 tls=0 ping56=1 ping1372=1     <- Enable NS packet filter for web mode
-t+94s  dns=0 tcp=0 tls=0 ping56=1 ping1372=1     <- CONNECTIVITY LOST
+-A nixos-fw-rpfilter -m rpfilter --validmark -j RETURN
+-A nixos-fw-rpfilter -j DROP
 ```
 
-**ICMP never stops working — including full-size DF packets.** Only TCP and DNS die.
-So this is not an MTU blackhole (ruled out: `ping -M do -s 1372` succeeds throughout)
-and not a dead link; it is *selective*, hitting exactly the traffic the client marks.
+Steering is asymmetric by construction. Packets leave through the tunnel device
+(`fwmark 0x5` → table 9 → `default dev sta0`) and their replies arrive back **on
+`sta0`**, while the route to those source addresses is via the physical interface.
+Strict rpfilter drops every one of them.
 
-The client installs
+The module therefore sets `networking.firewall.checkReversePath = mkDefault "loose"` —
+the same thing nixpkgs' tailscale module does, and overridable if you disagree.
+
+Measured on a real host, ~90s of live steering per run:
+
+| | strict (default) | `"loose"` |
+|---|---|---|
+| DNS / TCP | dead within ~27s | up for the whole window |
+| unsteered ICMP | fine throughout | fine |
+| traffic through tenant SWG | — | confirmed, 17/17 samples |
+| recovery | kill the daemon | n/a |
+
+Unsteered ICMP surviving while steered TCP/DNS died is the fingerprint: it is the
+*return path* being dropped, not the network being down.
+
+### The tunnel device
+
+`sta0` — not `tun*`, which is worth knowing before you go looking for it. Under
+steering it carries `100.65.0.2/16`, and table 9 holds `default dev sta0` plus
+per-destination bypasses for the corporate ranges.
+
+### What is left: `trustCA`
+
+With steering live the tenant re-signs every HTTPS connection:
 
 ```
-ip rule:  1:  from all fwmark 0x5 lookup 9
+issuer: O=<org>; CN=ns-swg.ca.<tenant>.goskope.com
+curl (system trust):  (60) self-signed certificate in certificate chain
+curl --cacert <tenant CA>: 200
 ```
 
-and table 9 holds **18 routes and no default** — just the bypass set (RFC1918, the
-loopback range, the tenant's own IPs) pointing at the physical gateway. So marked
-traffic (web ports 80/443, plus DNS) is policy-routed into a table that cannot route
-it, and is dropped. ICMP is never marked, which is why ping survives.
+So until the tenant CA is in the system trust store, HTTPS fails everywhere. Set
+`trustCA = true` and point `caCertFile` at the cert the enrolled client wrote to
+`${statePath}/ca-anchors/nstenantcert.crt`. The module warns when steering can run
+without it.
 
-The reason table 9 has no default is that **no interface is ever created**: `ip link`
-shows only `lo`, `virbr0`, `wlp2s0` throughout, and the kernel logs no registration.
-The client reports `KernelUserShim Device is opened` and `Enable NS packet filter for
-web mode`, and it programs the marking rules — but the VIF those rules depend on
-never appears, so it fails closed rather than open. Note also
-`nsFilterDevice Seting IPC port 0`: the redirect/IPC port the filter is configured
-with is zero.
+### Testing steering safely
 
-Also observed: **the daemon SEGVs on `systemctl stop`** (`code=killed, status=11/SEGV`),
-which is why it leaves the `ip rule` and table 9 behind instead of running its own
-teardown (`remove iptabls rules` / `remove ip route` / `remove ip rule`, which it does
-run correctly at *startup*). Clean up leftovers with `ip rule del fwmark 0x5 lookup 9`
-and `ip route flush table 9`.
+`tools/steering-test.sh` brings the client up under a dead-man's switch: it probes
+connectivity every 3s and tears everything down the moment it dies, on a hard timeout,
+or if the script is killed. Two things it learned the hard way, both of which will bite
+anyone doing this by hand:
 
-Ruled out: MTU, interface detection (`physical interface: wlp2s0`), tunnel
-establishment (it reaches the POP and gets an assigned IP), a missing kernel module
-(the client ships none — it is a userspace TUN design), and an iptables/nftables
-backend split (`networking.nftables.enable = false`, so both sides use iptables).
+- **`systemctl stop stagentd` is not a backout.** Its shutdown path does network work
+  that hangs when the network is down; 30s after `stop` it was still running, rules
+  still installed. Use `systemctl stop --no-block` *then* `systemctl kill -s KILL`.
+- **Order matters.** `kill -s KILL` on its own makes systemd restart it, because the
+  unit is `Restart=always`. Mark it stopping first.
 
-**Do not debug this on a machine you depend on without `autoStart = false`.** The
-tenant can forbid `stAgentCli disable`, and the daemon reinstates its rules when it
-restarts, so the recovery path is otherwise a reboot into an older generation.
-
-```nix
-services.netskope.autoStart = false;   # then: tools/steering-test.sh
-```
-
-`tools/steering-test.sh` brings the client up under a dead-man's switch: it starts the
-daemon *and the tray* (without the per-user agent the daemon has no session and never
-builds a tunnel, so steering is never exercised), probes each protocol separately, and
-stops both the moment connectivity dies — or on a hard timeout, or if the script
-itself is killed. Recovery is not left waiting on a human noticing.
+Even then the client cleans up nothing when killed, so the harness removes the
+`fwmark` rule, flushes table 9, deletes `sta0` and restarts `firewall.service` itself.
 
 ## Options
 

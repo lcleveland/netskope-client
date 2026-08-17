@@ -197,8 +197,7 @@ in
       }
     ];
 
-    warnings = lib.optional cfg.autoUpdate
-      "services.netskope.autoUpdate has no real effect on NixOS: the client cannot self-update the immutable store. Bump the packaged NSClient.run instead.";
+    warnings = lib.optional cfg.autoUpdate "services.netskope.autoUpdate has no real effect on NixOS: the client cannot self-update the immutable store. Bump the packaged NSClient.run instead.";
 
     environment.systemPackages = [ cfg.package ];
 
@@ -276,10 +275,11 @@ in
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
-        LoadCredential =
-          [ "orgkey:${enr.orgKeyFile}" ]
-          ++ lib.optional (enr.authTokenFile != null) "authtoken:${enr.authTokenFile}"
-          ++ lib.optional (enr.encryptTokenFile != null) "encrypttoken:${enr.encryptTokenFile}";
+        LoadCredential = [
+          "orgkey:${enr.orgKeyFile}"
+        ]
+        ++ lib.optional (enr.authTokenFile != null) "authtoken:${enr.authTokenFile}"
+        ++ lib.optional (enr.encryptTokenFile != null) "encrypttoken:${enr.encryptTokenFile}";
       };
       script = ''
         set -eu
@@ -313,7 +313,8 @@ in
       after = [
         "network-online.target"
         "netskope-setup.service"
-      ] ++ lib.optional enrollmentConfigured "netskope-enroll.service";
+      ]
+      ++ lib.optional enrollmentConfigured "netskope-enroll.service";
       wants = [ "network-online.target" ] ++ lib.optional enrollmentConfigured "netskope-enroll.service";
       path = [ pkgs.iptables ]; # steering programs iptables at runtime
       serviceConfig = {

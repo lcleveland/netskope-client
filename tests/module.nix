@@ -143,6 +143,27 @@ pkgs.testers.runNixOSTest {
     # Netskope client itself consumes /etc/ssl/certs as a CApath rather than a CAfile.
     machine.succeed("find /etc/ssl/certs -name '*.0' | grep -q .")
 
+    # The daemon must end up trusting what the system trusts. This is easy to get
+    # wrong -- it has its own /etc/ssl/certs, and pointing that at a build-time bundle
+    # makes it the one process on the machine that does NOT trust the tenant. That is
+    # not cosmetic: the client is not exempt from its own SSL inspection, so once
+    # steering is live its calls to achecker-<tenant>.goskope.com are re-signed too,
+    # and failing them breaks Private Access resolution (SERVFAIL) while every other
+    # symptom looks healthy.
+    machine.succeed("systemctl restart stagentd.service")
+    machine.wait_for_unit("stagentd.service")
+    pid = machine.succeed("systemctl show -p MainPID --value stagentd.service").strip()
+    daemon_certs = int(
+        machine.succeed(
+            f"nsenter --mount --target {pid} grep -c 'BEGIN CERTIFICATE' /etc/ssl/certs/ca-bundle.crt"
+        )
+    )
+    assert daemon_certs == after, f"daemon trusts {daemon_certs} CAs, system trusts {after}"
+    machine.succeed(
+        f"nsenter --mount --target {pid} "
+        "grep -qFf /var/lib/netskope/ca-anchors/nstenantcert.crt /etc/ssl/certs/ca-bundle.crt"
+    )
+
     # Strict reverse-path filtering DROPs every steered reply (they arrive on the tun
     # while the route to their source is via the physical link), which takes the whole
     # network down within ~27s of the tunnel coming up. The module defaults it to loose.

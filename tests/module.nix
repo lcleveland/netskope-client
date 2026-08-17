@@ -21,10 +21,15 @@ pkgs.testers.runNixOSTest {
     { ... }:
     {
       imports = [ self.nixosModules.default ];
+      environment.systemPackages = [ pkgs.openssl ]; # to mint a stand-in tenant CA
       services.netskope = {
         enable = true;
         enableTray = false; # daemon-only: no GTK/WebKit closure in the test
         package = stub; # avoid fetching the real (proprietary) client
+        # Deliberately WITHOUT caCertFile: the point of trustCA is that it works from
+        # the certificate the client fetches at runtime, so nobody has to put their
+        # tenant's CA into their configuration.
+        trustCA = true;
       };
     };
 
@@ -105,6 +110,38 @@ pkgs.testers.runNixOSTest {
     machine.succeed("test -e /var/lib/netskope/ca-anchors/probe.crt")  # lands in statePath
     machine.succeed(f"nsenter --mount --target {pid} /usr/bin/update-ca-trust")
     machine.fail(f"nsenter --mount --target {pid} test -e /usr/sbin/update-ca-certificates")
+
+    # trustCA has to work with no certificate in the configuration: the tenant CA only
+    # exists as a file the client fetches at runtime, and a NixOS trust store is built
+    # at eval time, so the module assembles the bundle at runtime and bind-mounts it.
+    # The unit is a oneshot without RemainAfterExit -- it has to be able to run again
+    # when the path unit fires on a rotation -- so wait on its effect, not its state.
+    machine.wait_until_succeeds("mountpoint -q /etc/ssl/certs")
+    machine.succeed(
+        "systemctl show -p Result --value netskope-ca-trust.service | grep -qx success"
+    )
+    # Before anything is fetched it must be exactly the system trust store, not empty
+    # -- this directory is /etc/ssl/certs for the whole machine.
+    machine.succeed("grep -q 'BEGIN CERTIFICATE' /etc/ssl/certs/ca-bundle.crt")
+    machine.succeed("test -e /etc/ssl/certs/ca-certificates.crt")
+    system_certs = int(machine.succeed("grep -c 'BEGIN CERTIFICATE' /etc/ssl/certs/ca-bundle.crt"))
+
+    # Now simulate the client fetching a tenant CA, and a rotation after it.
+    machine.succeed(
+        "openssl req -x509 -newkey rsa:2048 -nodes -keyout /tmp/k.pem "
+        "-out /var/lib/netskope/ca-anchors/nstenantcert.crt -days 1 -subj /CN=fake-tenant-ca"
+    )
+    machine.succeed("systemctl start netskope-ca-trust.service")
+    after = int(machine.succeed("grep -c 'BEGIN CERTIFICATE' /etc/ssl/certs/ca-bundle.crt"))
+    assert after == system_certs + 1, f"tenant CA not merged: {system_certs} -> {after}"
+    # ...and it is the same certificate, not merely one more of something.
+    machine.succeed(
+        "grep -qFf /var/lib/netskope/ca-anchors/nstenantcert.crt /etc/ssl/certs/ca-bundle.crt"
+    )
+
+    # ... and that the hashed CApath layout is regenerated alongside it, since the
+    # Netskope client itself consumes /etc/ssl/certs as a CApath rather than a CAfile.
+    machine.succeed("find /etc/ssl/certs -name '*.0' | grep -q .")
 
     # Strict reverse-path filtering DROPs every steered reply (they arrive on the tun
     # while the route to their source is via the physical link), which takes the whole

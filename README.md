@@ -23,7 +23,12 @@ exposes it as a NixOS module. Planning and decisions are tracked as a
 > the system trust store itself, and aborts its whole config cycle when that fails —
 > see [Tenant CA install](#tenant-ca-install).
 >
-> Not yet verified: traffic steering and the user certificate.
+> A sixth: steering needs `ip` (iproute2) on the daemon's PATH, and its absence is
+> silent — the tunnel connects, then the filter device fails to start and the client
+> reports `Internet Security disabled due to error` while looking healthy.
+>
+> Not yet verified: that steering actually carries traffic once the filter device
+> starts, and the user certificate.
 
 ## Quick start
 
@@ -143,6 +148,29 @@ The shim is a no-op on purpose: this system's trust store is built from
 trusting a MITM CA system-wide stays an explicit opt-in via `trustCA`. The useful
 side effect is that `${statePath}/ca-anchors/` is where the tenant CA lands in PEM
 form — which is what `caCertFile` needs, and the installer ships no CA.
+
+## Runtime tools
+
+The daemon shells out to a handful of commands and resolves them through `PATH`, so
+`systemd.services.stagentd.path` is enough — no FHS shims needed. It wants `iptables`,
+`ip6tables`, `ip` and `dmidecode`; everything else it probes for (`dpkg`, `rpm`,
+`realm`, `pgrep`, `traceroute`, …) goes unused in this configuration.
+
+`ip` is the one that matters, and losing it fails in a way that is easy to misread:
+
+```
+nsTunHandler.cpp:516  Failed to find ip or iptables command
+nsNetTool.cpp:79      Command ip not found!
+tunnelMgr.cpp:1288    failed to start filter device
+tunnel.cpp:447        TLS received nsssl_closed, tunnel destroyed
+```
+
+The TLS tunnel to the POP comes up first and is reported as established, complete with
+an assigned IP — only then does the filter device that intercepts traffic fail, so the
+daemon stays running, the tray shows a connection, and nothing is actually steered.
+The client drives its TUN device with `ip route` / `ip rule` (policy routing on table 1
+with an fwmark) and asks `ip route get` for the egress interface, which is also why a
+missing `ip` shows up as `Failed to get MTU on device = `.
 
 ## Options
 

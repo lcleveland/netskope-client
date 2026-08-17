@@ -97,6 +97,11 @@ pkgs.testers.runNixOSTest {
     machine.succeed(f"nsenter --mount --target {pid} /usr/bin/update-ca-trust")
     machine.fail(f"nsenter --mount --target {pid} test -e /usr/sbin/update-ca-certificates")
 
+    # Steering needs `ip` on the daemon's PATH: without it the tunnel connects and
+    # then the filter device fails to start, leaving the client "healthy" but not
+    # steering a packet. Cheap regression guard, since the stub cannot exercise it.
+    machine.succeed("systemctl show -p Environment stagentd.service | grep -q iproute2")
+
     # None of that may leak onto the host: these paths exist only in the namespace.
     machine.fail("test -e /usr/bin/update-ca-trust")
     machine.fail("test -e /etc/pki/ca-trust/source/anchors")

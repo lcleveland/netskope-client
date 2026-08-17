@@ -520,7 +520,31 @@ in
       ]
       ++ lib.optional enrollmentConfigured "netskope-enroll.service";
       wants = [ "network-online.target" ] ++ lib.optional enrollmentConfigured "netskope-enroll.service";
-      path = [ pkgs.iptables ]; # steering programs iptables at runtime
+      # Runtime tools the daemon shells out to. It resolves them through PATH (not
+      # absolute FHS paths), so putting them here is enough.
+      #
+      # iproute2 is load-bearing for steering, and its absence is quiet: the tunnel
+      # comes up fine, then the filter device that actually intercepts traffic fails
+      # to start, so the client reports "Internet Security disabled due to error"
+      # while looking otherwise healthy. Verified on a real host:
+      #
+      #   nsTunHandler.cpp:516  Failed to find ip or iptables command
+      #   nsNetTool.cpp:79      Command ip not found!
+      #   tunnelMgr.cpp:1288    failed to start filter device
+      #   tunnel.cpp:447        TLS received nsssl_closed, tunnel destroyed
+      #
+      # The client drives its TUN device with `ip route`/`ip rule` (policy routing on
+      # table 1 with an fwmark) and asks `ip route get` for the egress interface --
+      # which is also why the MTU probe logs "Failed to get MTU on device = ".
+      #
+      # dmidecode is not fatal: the device make/model/serial it reports to the tenant
+      # come from sysfs when it is missing, but the daemon still probes for it (18
+      # "Command dmidecode not found!" in a single boot), so give it the real thing.
+      path = [
+        pkgs.iptables
+        pkgs.iproute2
+        pkgs.dmidecode
+      ];
       serviceConfig = {
         Type = "simple";
         # Launch via the materialised /opt path (not the store) so the client's

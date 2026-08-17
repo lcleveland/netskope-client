@@ -198,20 +198,64 @@ MTU 1500), the tunnel *does* establish to the POP with an assigned IP, and the h
 firewall is iptables-backed (`networking.nftables.enable = false`), so the client's
 mangle rules and NixOS' filter rules are not on different backends.
 
-Open leads: the tunnel MTU is taken straight from the physical interface (1500) with
-no visible allowance for encapsulation, which would blackhole full-size packets while
-leaving small ones fine; `nsRtNetlink ipRouteGet: failed to get response` appears four
-times while steering is being set up; and DNS is explicitly steered
-(`set IPv4/IPv6 DNS packet filtering rules`) on a host whose resolver is
-systemd-resolved on 127.0.0.53.
+### What the failure actually is
+
+Measured with `tools/steering-test.sh`, which probes each protocol separately while
+steering is live. The signature is not "the network is down":
+
+```
+t+16s  dns=1 tcp=1 tls=1 ping56=1 ping1372=1     <- before steering engages
+t+33s  dns=1 tcp=0 tls=0 ping56=1 ping1372=1     <- Enable NS packet filter for web mode
+t+94s  dns=0 tcp=0 tls=0 ping56=1 ping1372=1     <- CONNECTIVITY LOST
+```
+
+**ICMP never stops working — including full-size DF packets.** Only TCP and DNS die.
+So this is not an MTU blackhole (ruled out: `ping -M do -s 1372` succeeds throughout)
+and not a dead link; it is *selective*, hitting exactly the traffic the client marks.
+
+The client installs
+
+```
+ip rule:  1:  from all fwmark 0x5 lookup 9
+```
+
+and table 9 holds **18 routes and no default** — just the bypass set (RFC1918, the
+loopback range, the tenant's own IPs) pointing at the physical gateway. So marked
+traffic (web ports 80/443, plus DNS) is policy-routed into a table that cannot route
+it, and is dropped. ICMP is never marked, which is why ping survives.
+
+The reason table 9 has no default is that **no interface is ever created**: `ip link`
+shows only `lo`, `virbr0`, `wlp2s0` throughout, and the kernel logs no registration.
+The client reports `KernelUserShim Device is opened` and `Enable NS packet filter for
+web mode`, and it programs the marking rules — but the VIF those rules depend on
+never appears, so it fails closed rather than open. Note also
+`nsFilterDevice Seting IPC port 0`: the redirect/IPC port the filter is configured
+with is zero.
+
+Also observed: **the daemon SEGVs on `systemctl stop`** (`code=killed, status=11/SEGV`),
+which is why it leaves the `ip rule` and table 9 behind instead of running its own
+teardown (`remove iptabls rules` / `remove ip route` / `remove ip rule`, which it does
+run correctly at *startup*). Clean up leftovers with `ip rule del fwmark 0x5 lookup 9`
+and `ip route flush table 9`.
+
+Ruled out: MTU, interface detection (`physical interface: wlp2s0`), tunnel
+establishment (it reaches the POP and gets an assigned IP), a missing kernel module
+(the client ships none — it is a userspace TUN design), and an iptables/nftables
+backend split (`networking.nftables.enable = false`, so both sides use iptables).
 
 **Do not debug this on a machine you depend on without `autoStart = false`.** The
 tenant can forbid `stAgentCli disable`, and the daemon reinstates its rules when it
 restarts, so the recovery path is otherwise a reboot into an older generation.
 
 ```nix
-services.netskope.autoStart = false;   # then: systemctl start stagentd
+services.netskope.autoStart = false;   # then: tools/steering-test.sh
 ```
+
+`tools/steering-test.sh` brings the client up under a dead-man's switch: it starts the
+daemon *and the tray* (without the per-user agent the daemon has no session and never
+builds a tunnel, so steering is never exercised), probes each protocol separately, and
+stops both the moment connectivity dies — or on a hard timeout, or if the script
+itself is killed. Recovery is not left waiting on a human noticing.
 
 ## Options
 

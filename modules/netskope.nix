@@ -46,6 +46,18 @@ let
     ln -s ${config.security.pki.caBundle} ca-bundle.crt
     ln -s ${config.security.pki.caBundle} ca-certificates.crt
   '';
+
+  # Stand-in for the distro tool that rebuilds the system trust store from its
+  # anchors directory -- see the CA-install notes on stagentd.service below.
+  caTrustShim = pkgs.writeShellScript "netskope-update-ca-trust" ''
+    # Nothing to regenerate: this system's trust store is built from
+    # security.pki.certificateFiles at activation, not from a mutable anchors dir.
+    # Succeeding here is the point -- it is what lets the client finish its config
+    # update. Trusting the tenant CA system-wide stays an explicit opt-in via
+    # services.netskope.trustCA.
+    echo "netskope: CA anchors updated; system trust is declarative (services.netskope.trustCA)" >&2
+    exit 0
+  '';
 in
 {
   options.services.netskope = {
@@ -148,10 +160,13 @@ in
       example = "/etc/netskope/nstenantcert.crt";
       description = ''
         Path to the Netskope root CA (PEM) used for SSL inspection. The installer
-        does NOT ship it, so it cannot be derived from the package; obtain it from
-        your tenant admin console, or copy it off an already-enrolled host (the
-        client names it `nstenantcert.crt`; under this module's state relocation it
-        lands in `''${statePath}/app/data/`).
+        does NOT ship it, so it cannot be derived from the package -- but an
+        enrolled client downloads it and writes it out in PEM form, so the simplest
+        source is this host itself: once the daemon has run a config update, look in
+        `''${statePath}/ca-anchors/` for `nstenantcert.crt` (SSL inspection) and
+        `nscacert.crt` (the Netskope root). Failing that, take it from the tenant
+        admin console. (The client's own encrypted copies live in
+        `''${statePath}/app/data/*.pem.enc` and are not directly usable.)
       '';
     };
 
@@ -371,6 +386,12 @@ in
         # 0700 data/ fails them with EACCES.
         install -d -m 0755 "$app" "$app/data" "$app/logs"
 
+        # Bind source for the daemon's CA anchors dir (see stagentd.service). Kept
+        # beside the app dir rather than inside it, since it is not part of the
+        # client's own tree, and 0755 so the tenant CA the client drops here can be
+        # read back out for services.netskope.caCertFile.
+        install -d -m 0755 "${cfg.statePath}/ca-anchors"
+
         # Refresh the shipped files whenever the package changes. Only names that came
         # from the store are removed, so the client's own state (.mid, provisioning,
         # nsconfig.json, nsbranding.json, ...) survives a version bump untouched.
@@ -506,10 +527,52 @@ in
         # hard-coded /opt/netskope/stagent state lookups resolve to writable dirs.
         ExecStart = "/opt/netskope/stagent/stAgentSvc";
         WorkingDirectory = "/opt/netskope/stagent";
-        # The daemon re-fetches branding, config and the tenant CA on its own
-        # schedule, all over TLS, and needs the same rehashed trust dir the enroll
-        # unit does (see caCertDir).
-        BindReadOnlyPaths = [ "${caCertDir}:/etc/ssl/certs" ];
+
+        # Two mount tweaks, both confined to this unit's namespace -- nothing new
+        # appears on the host.
+        #
+        # 1. The rehashed trust dir the enroll unit also needs (see caCertDir): the
+        #    daemon re-fetches branding, config and the tenant CA on its own
+        #    schedule, all over TLS.
+        #
+        # 2. The CA the daemon installs ITSELF. Once enrolled it downloads the
+        #    Netskope root and tenant CAs and tries to add them to the system trust
+        #    store through FHS paths that do not exist here, and it treats failure
+        #    as fatal to the whole config update -- verified on a real host:
+        #
+        #      failed to open file for writing:
+        #        /etc/pki/ca-trust/source/anchors/nscacert.crt, err: 2
+        #      cert system ca cert is not installed
+        #      Install CA failed, ca rotation status 2, 0
+        #      config update failed, retry in 9 minutes
+        #
+        #    ...so the client never converges: enrollment succeeds, then every
+        #    config cycle rolls back nine minutes later.
+        #
+        #    cert.cpp picks its layout by probing for /usr/sbin/update-ca-certificates
+        #    (Debian: write /usr/local/share/ca-certificates, then run that tool) and
+        #    otherwise falls back to the RHEL pair, /etc/pki/ca-trust/source/anchors
+        #    plus /usr/bin/update-ca-trust. Blanking /usr makes that choice ours
+        #    rather than the host's, so give it the RHEL layout: a writable anchors
+        #    dir under statePath and a shim for the refresh tool.
+        #
+        #    The anchors dir is where the tenant CA lands in PEM form, which is the
+        #    answer to caCertFile's chicken-and-egg problem -- the installer ships no
+        #    CA, but an enrolled client writes one to
+        #    ''${statePath}/ca-anchors/nstenantcert.crt.
+        BindReadOnlyPaths = [
+          "${caCertDir}:/etc/ssl/certs"
+          "${caTrustShim}:/usr/bin/update-ca-trust"
+        ];
+        BindPaths = [ "${cfg.statePath}/ca-anchors:/etc/pki/ca-trust/source/anchors" ];
+        # Empty tmpfs mount points for the two trees above to be created in. /usr
+        # holds nothing the daemon uses (on NixOS it is just /usr/bin/env), and
+        # /etc/pki/ca-trust is unused here -- NixOS' own bundle lives in
+        # /etc/pki/tls, which stays visible.
+        TemporaryFileSystem = [
+          "/usr:ro"
+          "/etc/pki/ca-trust:ro"
+        ];
         Restart = "always";
         RestartSec = 10;
       };

@@ -83,5 +83,25 @@ pkgs.testers.runNixOSTest {
 
     # Namespacing the daemon must not hide the /opt bind mount it execs from.
     machine.succeed(f"nsenter --mount --target {pid} mountpoint -q /opt/netskope/stagent")
+
+    # Once enrolled the client installs the tenant CA into the system trust store
+    # itself, and treats failure as fatal to the whole config update ("Install CA
+    # failed" -> "config update failed, retry in 9 minutes"). It needs a writable
+    # anchors dir and a refresh tool; give it the RHEL pair, since blanking /usr
+    # means it cannot find Debian's /usr/sbin/update-ca-certificates.
+    machine.succeed(
+        f"nsenter --mount --target {pid} "
+        "touch /etc/pki/ca-trust/source/anchors/probe.crt"
+    )
+    machine.succeed("test -e /var/lib/netskope/ca-anchors/probe.crt")  # lands in statePath
+    machine.succeed(f"nsenter --mount --target {pid} /usr/bin/update-ca-trust")
+    machine.fail(f"nsenter --mount --target {pid} test -e /usr/sbin/update-ca-certificates")
+
+    # None of that may leak onto the host: these paths exist only in the namespace.
+    machine.fail("test -e /usr/bin/update-ca-trust")
+    machine.fail("test -e /etc/pki/ca-trust/source/anchors")
+    # NixOS' own bundle sits in /etc/pki/tls and must survive the /etc/pki/ca-trust
+    # overlay.
+    machine.succeed(f"nsenter --mount --target {pid} test -e /etc/pki/tls/certs/ca-bundle.crt")
   '';
 }

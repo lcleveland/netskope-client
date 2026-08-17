@@ -63,6 +63,30 @@ in
       '';
     };
 
+    statePath = lib.mkOption {
+      type = lib.types.str;
+      default = "/var/lib/netskope";
+      description = ''
+        Directory holding all of the client's mutable state: its device identity
+        (`.mid`, `provisioning`), its config (`nsconfig.json`, `nsuser.conf`), the
+        enrollment result (`nsbranding.json`), and the `data/` + `logs/` subdirs.
+
+        The client hard-codes /opt/netskope/stagent and writes state there, so the
+        module keeps the real directory at `''${statePath}/app` and bind-mounts it
+        onto that path (see netskope-setup.service for why it must be a bind mount
+        and not a symlink).
+
+        On an impermanent / tmpfs-root host this is the one and only path to
+        persist -- e.g. with nix-community/impermanence:
+
+          environment.persistence."/persist".directories = [ "/var/lib/netskope" ];
+
+        Nothing under /opt needs persisting; those files are refreshed from the Nix
+        store on every activation. Without persistence the client loses its identity
+        and enrollment on every boot and re-registers as a brand-new device.
+      '';
+    };
+
     enableTray = lib.mkOption {
       type = lib.types.bool;
       default = true;
@@ -90,7 +114,7 @@ in
         does NOT ship it, so it cannot be derived from the package; obtain it from
         your tenant admin console, or copy it off an already-enrolled host (the
         client names it `nstenantcert.crt`; under this module's state relocation it
-        lands at /var/lib/netskope/data/).
+        lands in `''${statePath}/app/data/`).
       '';
     };
 
@@ -206,22 +230,43 @@ in
     # supplies it via caCertFile; it is added at build time to the system bundle.
     security.pki.certificateFiles = lib.mkIf (cfg.trustCA && cfg.caCertFile != null) [ cfg.caCertFile ];
 
-    # Writable-state relocation (issue #7).
+    # Writable-state relocation (issue #7) and impermanence support.
     #
-    # The client hard-codes /opt/netskope/stagent and both READS its shipped files
-    # and WRITES runtime state under that same path (data/ = certs + the .eetk
-    # enrollment token + config, logs/, plus stray top-level files and sockets) --
-    # read-only in /nix/store. Strategy: materialise /opt/netskope/stagent as a real
-    # root-owned directory; symlink every shipped file in from the store (immutable)
-    # and redirect the writable subdirs data/ + logs/ to persistent /var/lib/netskope.
-    # Because the top dir is itself a real writable directory, the daemon can still
-    # create ad-hoc files (.eetk, sockets) directly under it. Re-materialised on each
-    # boot/switch by a oneshot ordered before the daemon, so it survives nixpkgs bumps
-    # without enumerating filenames at eval time.
+    # Two hard constraints come from the proprietary client:
+    #
+    #  1. It hard-codes /opt/netskope/stagent and both READS its shipped files and
+    #     WRITES runtime state under that same path -- device identity (.mid,
+    #     provisioning), config (nsconfig.json, nsuser.conf), the enrollment result
+    #     (nsbranding.json), the data/ + logs/ subdirs, and the svc socket.
+    #  2. Its IPC layer (NSCom2) authenticates peers by resolving the connecting
+    #     process's /proc/<pid>/exe and matching it against a hard-coded allowlist of
+    #     /opt/netskope/stagent/{stAgentApp,stAgentCli,stAgentUI,nsdiag,bwansvc}.
+    #
+    # (2) rules out the obvious packaging approach. Symlinking the binaries in from
+    # the store makes /proc/<pid>/exe resolve to the store path, so stAgentSvc
+    # rejects every peer -- "NSCOM2 invalid client connection from /nix/store/...",
+    # "handleNewClient failed -8". The daemon still starts and looks healthy, but the
+    # tray never appears and stAgentCli reports "Failed to connect to Netskope Client
+    # service". The shipped files must be REAL FILES at the hard-coded path.
+    #
+    # Strategy: keep the real directory at ''${statePath}/app -- populated by copying
+    # the shipped files out of the store, refreshed when the package changes -- and
+    # bind-mount it onto /opt/netskope/stagent. A bind mount, unlike a symlink,
+    # preserves the visible path, so /proc/<pid>/exe reads back as
+    # /opt/netskope/stagent/... and the peer check passes.
+    #
+    # This is also what makes the module work unchanged on a tmpfs root: every
+    # mutable file lives under the single statePath, so persisting that one directory
+    # is all an impermanent host has to do, and /opt stays fully disposable. Reaching
+    # state through the /opt bind mount has a second benefit -- a locked-down (0700)
+    # statePath no longer blocks the per-user stAgentUI/stAgentCli from traversing
+    # into data/ for nsusercert.p12, because they never walk the statePath itself.
     systemd.services.netskope-setup = {
-      description = "Prepare /opt/netskope/stagent (Netskope writable-state relocation)";
+      description = "Prepare /opt/netskope/stagent (Netskope state relocation)";
       wantedBy = [ "multi-user.target" ];
       before = [ "stagentd.service" ];
+      path = [ pkgs.util-linux ]; # mount, mountpoint
+      unitConfig.RequiresMountsFor = cfg.statePath;
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
@@ -229,25 +274,35 @@ in
       script = ''
         set -eu
         src="${cfg.package}/opt/netskope/stagent"
+        app="${cfg.statePath}/app"
         dst="/opt/netskope/stagent"
-        state="/var/lib/netskope"
+        stamp="$app/.nix-generation"
 
-        install -d -m 0755 "$dst"
-        install -d -m 0700 "$state/data"
-        install -d -m 0755 "$state/logs"
+        # Modes follow upstream install.sh, which does `chmod 755` on the app dir and
+        # logs/ and `mkdir -p -m 755 data`. data/ must not be root-only: stAgentUI and
+        # stAgentCli run as the logged-in user and read data/nsusercert.p12, and a
+        # 0700 data/ fails them with EACCES.
+        install -d -m 0755 "$app" "$app/data" "$app/logs"
 
-        # Clear stale symlinks from a previous generation; keep real files the
-        # client dropped in the top dir (e.g. the .eetk enrollment token).
-        find "$dst" -maxdepth 1 -type l -delete
+        # Refresh the shipped files whenever the package changes. Only names that came
+        # from the store are removed, so the client's own state (.mid, provisioning,
+        # nsconfig.json, nsbranding.json, ...) survives a version bump untouched.
+        if [ "$(cat "$stamp" 2>/dev/null || true)" != "$src" ]; then
+          for f in "$src"/*; do
+            rm -rf "$app/$(basename "$f")"
+          done
+          cp -a "$src"/. "$app"/
+          # Store files are read-only; the client rewrites some of them in place.
+          chmod -R u+w "$app"
+          printf %s "$src" > "$stamp"
+        fi
 
-        # Symlink every shipped file from the store (read-only, immutable).
-        for f in "$src"/*; do
-          ln -sfn "$f" "$dst/$(basename "$f")"
-        done
-
-        # Redirect the writable subdirs to persistent state.
-        ln -sfn "$state/data" "$dst/data"
-        ln -sfn "$state/logs" "$dst/logs"
+        # Bind-mount onto the path the client hard-codes. Guarded so that a
+        # nixos-rebuild switch which re-runs this unit does not stack mounts.
+        install -d -m 0755 /opt/netskope "$dst"
+        if ! mountpoint -q "$dst"; then
+          mount --bind "$app" "$dst"
+        fi
       '';
     };
 
@@ -275,6 +330,10 @@ in
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
+        # installerutil resolves its siblings relative to the app dir, and must be
+        # the copy at this path (not the store) for the IPC peer check -- see
+        # netskope-setup.service.
+        WorkingDirectory = "/opt/netskope/stagent";
         LoadCredential = [
           "orgkey:${enr.orgKeyFile}"
         ]
@@ -285,9 +344,15 @@ in
         set -eu
         appPath=/opt/netskope/stagent
 
-        # Idempotent: the .eetk token is written on successful enrollment.
-        if [ -e "$appPath/.eetk" ] || [ -e /var/lib/netskope/data/.eetk ]; then
-          echo "netskope: already enrolled, skipping"
+        # Idempotency marker. install.sh treats the downloaded branding file as the
+        # "enroll config ready" signal (isEnrollConfigReady), so that is what we
+        # check. NB: an earlier version of this unit looked for a `.eetk` token --
+        # that string does not appear in any shipped binary, so the guard never
+        # fired and enrollment re-ran on every boot.
+        if [ -e "$appPath/nsbranding.json" ] \
+          || [ -e "$appPath/nsbranding.json.enc" ] \
+          || [ -e "$appPath/nsidpconfig.json" ]; then
+          echo "netskope: already enrolled (branding file present), skipping"
           exit 0
         fi
 
@@ -303,6 +368,22 @@ in
         json="{\"LoginUser\":\"root\",\"ReportFileName\":\"$report\",\"MyRunFileName\":\"\",\"TenantHostname\":\"${cfg.tenantHost}\",\"Orgkey\":\"$orgkey\",\"UserEmail\":\"${optStr enr.email}\",\"UserUpn\":\"${optStr enr.upn}\",\"IdpMode\":\"\",\"TenantName\":\"\",\"TenantDomain\":\"\",\"EnrollAuthToken\":\"$authtoken\",\"EnrollEncryptToken\":\"$encrypttoken\",\"InstallTags\":\"\"}"
 
         "$appPath/installerutil" "--download_branding_file" "$json"
+
+        # installerutil exits 0 even when the tenant rejects the enrollment; it
+        # reports through a file under logs/ (install.sh cats it). Surface that, then
+        # verify the branding file actually landed -- otherwise this unit "succeeds"
+        # with the client still unenrolled and RemainAfterExit stops it retrying.
+        if [ -f "$appPath/logs/$report" ]; then
+          cat "$appPath/logs/$report"
+          rm -f "$appPath/logs/$report"
+        fi
+
+        if [ ! -e "$appPath/nsbranding.json" ] \
+          && [ ! -e "$appPath/nsbranding.json.enc" ] \
+          && [ ! -e "$appPath/nsidpconfig.json" ]; then
+          echo "netskope: enrollment failed - no branding file downloaded from ${cfg.tenantHost}" >&2
+          exit 1
+        fi
       '';
     };
 

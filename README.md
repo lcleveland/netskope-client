@@ -72,7 +72,7 @@ enrollment service reads them through systemd credentials at activation.
 | `tenant` / `hash` / `sourceUrl` | client source (see above) |
 | `package` | override the built package |
 | `statePath` (default `/var/lib/netskope`) | all mutable client state; the one path to persist |
-| `enableTray` (default `true`) | tray UI: `stAgentUI` + `stagentapp` user service |
+| `enableTray` (default `true`) | tray UI: `stagentapp` (watchdog) + `stagentui` (icon) user services + launcher entry |
 | `tenantHost` | enrollment host (defaults to `addon-<tenant>.goskope.com`) |
 | `enrollment.{orgKeyFile,authTokenFile,encryptTokenFile,email,upn}` | enrollment params |
 | `trustCA` / `caCertFile` | add the Netskope root CA to system trust |

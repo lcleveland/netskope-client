@@ -91,8 +91,9 @@ in
       type = lib.types.bool;
       default = true;
       description = ''
-        Build and run the per-user tray UI (stAgentUI + the stagentapp user service).
-        Disable on headless hosts to drop the heavy GTK/WebKit closure.
+        Build and run the per-user tray UI: the `stagentapp` (watchdog) and `stagentui`
+        (tray icon) user services, plus a launcher entry. Disable on headless hosts to
+        drop the heavy GTK/WebKit closure.
       '';
     };
 
@@ -223,7 +224,21 @@ in
 
     warnings = lib.optional cfg.autoUpdate "services.netskope.autoUpdate has no real effect on NixOS: the client cannot self-update the immutable store. Bump the packaged NSClient.run instead.";
 
-    environment.systemPackages = [ cfg.package ];
+    environment.systemPackages = [
+      cfg.package
+    ]
+    # Launcher entry for the tray UI. Upstream install.sh drops this into
+    # /usr/share/applications; here it rides in via systemPackages, which
+    # XDG_DATA_DIRS already covers. Its Exec/Icon point at the bind-mounted /opt path,
+    # so no rewriting is needed. Deliberately NOT installed into /etc/xdg/autostart:
+    # the UI's lifecycle belongs to the stagentui user service below, and an autostart
+    # entry would race it for a second instance.
+    ++ lib.optional cfg.enableTray (
+      pkgs.runCommandLocal "netskope-stagentui-desktop" { } ''
+        install -Dm644 ${cfg.package}/opt/netskope/stagent/stagentui.desktop \
+          "$out/share/applications/stagentui.desktop"
+      ''
+    );
 
     # Netskope's SSL inspection MITMs TLS, so its root CA must be trusted
     # system-wide (issue #8). The installer does not ship the cert, so the user
@@ -409,19 +424,57 @@ in
       };
     };
 
-    # Per-user tray UI (#4). Runs stAgentApp (the tray/watchdog) in the user's
-    # graphical session; the shipped stagentapp.service targets default.target,
-    # rewired here to graphical-session.target.
-    systemd.user.services.stagentapp = lib.mkIf cfg.enableTray {
-      description = "Netskope client tray agent";
-      wantedBy = [ "graphical-session.target" ];
-      partOf = [ "graphical-session.target" ];
-      after = [ "graphical-session.target" ];
-      serviceConfig = {
-        Type = "simple";
-        ExecStart = "/opt/netskope/stagent/stAgentApp";
-        Restart = "on-failure";
-        RestartSec = 5;
+    # Per-user tray UI (#4).
+    #
+    # This is two processes, not one: stAgentApp is the watchdog / session IPC broker,
+    # and stAgentUI is the actual GTK tray icon. Upstream splits their lifecycles --
+    # stagentapp.service runs the watchdog, while the UI is autostarted by the desktop
+    # session from /etc/xdg/autostart/stagentui.desktop, with stAgentApp otherwise
+    # launching it through /usr/bin/gtk-launch. Neither route works here: this module
+    # installs no XDG autostart entry, and gtk-launch does not exist at that
+    # hard-coded path on NixOS. So the watchdog ran happily forever and no tray icon
+    # ever appeared -- while stAgentUI, run by hand, works perfectly ("UISystemTray
+    # Show system tray icon"). Its /bin/ps and /bin/grep lookups fail on NixOS but are
+    # non-fatal; it registers its icon regardless, so no FHS shim is needed.
+    #
+    # Hand the UI's lifecycle to systemd instead of depending on the compositor's
+    # autostart handling or an FHS path.
+    systemd.user.services = lib.mkIf cfg.enableTray {
+      stagentapp = {
+        description = "Netskope client tray agent (watchdog)";
+        wantedBy = [ "graphical-session.target" ];
+        partOf = [ "graphical-session.target" ];
+        after = [ "graphical-session.target" ];
+        serviceConfig = {
+          Type = "simple";
+          ExecStart = "/opt/netskope/stagent/stAgentApp";
+          WorkingDirectory = "/opt/netskope/stagent";
+          # The client refuses IPC peers whose LD_LIBRARY_PATH holds "non-standard"
+          # paths -- "invalid client connection ... due to code injection" -- and any
+          # /nix/store entry trips it. Session managers readily import the variable
+          # into the user manager, so drop it for these units.
+          UnsetEnvironment = "LD_LIBRARY_PATH";
+          Restart = "on-failure";
+          RestartSec = 5;
+        };
+      };
+
+      stagentui = {
+        description = "Netskope client tray icon";
+        wantedBy = [ "graphical-session.target" ];
+        partOf = [ "graphical-session.target" ];
+        after = [
+          "graphical-session.target"
+          "stagentapp.service"
+        ];
+        serviceConfig = {
+          Type = "simple";
+          ExecStart = "/opt/netskope/stagent/stAgentUI";
+          WorkingDirectory = "/opt/netskope/stagent";
+          UnsetEnvironment = "LD_LIBRARY_PATH";
+          Restart = "on-failure";
+          RestartSec = 5;
+        };
       };
     };
   };

@@ -354,7 +354,32 @@ in
       }
     ];
 
-    warnings = lib.optional cfg.autoUpdate "services.netskope.autoUpdate has no real effect on NixOS: the client cannot self-update the immutable store. Bump the packaged NSClient.run instead.";
+    warnings =
+      lib.optional cfg.autoUpdate "services.netskope.autoUpdate has no real effect on NixOS: the client cannot self-update the immutable store. Bump the packaged NSClient.run instead."
+      ++
+        lib.optional
+          (
+            config.networking.firewall.enable
+            && builtins.elem config.networking.firewall.checkReversePath [
+              true
+              "strict"
+            ]
+          )
+          ''
+            services.netskope is enabled with networking.firewall.checkReversePath set to strict.
+            Steering is asymmetric -- replies come back in on the sta0 tunnel while the route to
+            their source is via the physical interface -- so a strict reverse-path filter DROPs
+            every steered reply. Measured on a real host: DNS, TCP and TLS all dead within ~27s
+            of the tunnel coming up, with no way back short of killing the daemon. This module
+            defaults the option to "loose"; something in your configuration has forced it back.
+          ''
+      ++ lib.optional (cfg.enable && !cfg.trustCA) ''
+        services.netskope.trustCA is off. Once steering is live the tenant re-signs every
+        HTTPS connection with its own CA, so anything using the system trust store will fail
+        with "self-signed certificate in certificate chain" until that CA is trusted. An
+        enrolled client writes it to ''${cfg.statePath}/ca-anchors/nstenantcert.crt -- point
+        services.netskope.caCertFile at a copy and set trustCA = true.
+      '';
 
     environment.systemPackages = [
       cfg.package
@@ -376,6 +401,30 @@ in
     # system-wide (issue #8). The installer does not ship the cert, so the user
     # supplies it via caCertFile; it is added at build time to the system bundle.
     security.pki.certificateFiles = lib.mkIf (cfg.trustCA && cfg.caCertFile != null) [ cfg.caCertFile ];
+
+    # NixOS' reverse-path filter has to be loosened or steering takes the whole
+    # network down with it.
+    #
+    # networking.firewall.checkReversePath defaults to true, which installs
+    #
+    #   -A nixos-fw-rpfilter -m rpfilter --validmark -j RETURN
+    #   ... -A nixos-fw-rpfilter -j DROP
+    #
+    # in mangle PREROUTING -- strict mode. Steering is asymmetric by construction:
+    # packets leave through the sta0 tunnel device (fwmark 0x5 -> table 9 -> default
+    # dev sta0) and their replies come back in on sta0, while the route to those
+    # source addresses is via the physical interface. Strict rpfilter therefore DROPs
+    # every reply.
+    #
+    # Measured on a real host, with the client steering: strict rpfilter took DNS,
+    # TCP and TLS to zero within ~27s -- total loss, recoverable only by killing the
+    # daemon -- while unsteered ICMP kept flowing, which is the signature of the
+    # steered traffic specifically being dropped on the way back. The same run with
+    # this set to loose held all three up for the full window.
+    #
+    # mkDefault, so a host that has thought about it can still say otherwise -- the
+    # same approach nixpkgs' own tailscale module takes for the same reason.
+    networking.firewall.checkReversePath = lib.mkDefault "loose";
 
     # Writable-state relocation (issue #7) and impermanence support.
     #

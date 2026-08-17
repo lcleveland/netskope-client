@@ -106,6 +106,13 @@ pkgs.testers.runNixOSTest {
     machine.succeed(f"nsenter --mount --target {pid} /usr/bin/update-ca-trust")
     machine.fail(f"nsenter --mount --target {pid} test -e /usr/sbin/update-ca-certificates")
 
+    # Strict reverse-path filtering DROPs every steered reply (they arrive on the tun
+    # while the route to their source is via the physical link), which takes the whole
+    # network down within ~27s of the tunnel coming up. The module defaults it to loose.
+    machine.succeed(
+        "iptables -t mangle -S nixos-fw-rpfilter | grep -q -- '--loose'"
+    )
+
     # Steering needs `ip`, and the client looks for it at /usr/sbin/ip specifically --
     # not on PATH, which is why systemd.services.*.path does not help. Without it the
     # tunnel connects and only then does the filter device fail, leaving a daemon that

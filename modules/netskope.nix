@@ -10,6 +10,42 @@ let
   enr = cfg.enrollment;
   optStr = s: if s == null then "" else s;
   enrollmentConfigured = cfg.tenantHost != "" && enr.orgKeyFile != null;
+
+  # The system trust store in OpenSSL's hashed-directory layout.
+  #
+  # The client asks OpenSSL to verify peers with a CApath of /etc/ssl/certs and NO
+  # CAfile -- verified on a real host: "peer Set SSL CA locations, file: , dir:
+  # /etc/ssl/certs" (it picks a CAfile only on Fedora/RHEL, gated on
+  # /etc/{fedora,redhat}-release). A CApath is looked up through
+  # <subject-hash>.<seq> symlinks, which Debian and friends generate; NixOS'
+  # /etc/ssl/certs holds only ca-bundle.crt and ca-certificates.crt and no hashed
+  # links, so the client finds ZERO trust anchors and every TLS handshake fails:
+  #
+  #   peer cert verify err: 19, errMsg: self-signed certificate in certificate
+  #   chain, depth: 2, subject: /OU=GlobalSign Root CA - R3/...
+  #   curl_easy_perform failed, code 60
+  #
+  # That is what broke enrollment (and every config/branding fetch the daemon
+  # makes). SSL_CERT_DIR, SSL_CERT_FILE and CURL_CA_BUNDLE are all ignored -- the
+  # path is compiled in -- so the fix is to give the client's units a rehashed
+  # /etc/ssl/certs via BindReadOnlyPaths, leaving the rest of the system alone.
+  #
+  # Derived from security.pki.caBundle, so `trustCA`'s tenant CA is included
+  # automatically. Both bundle files are kept alongside the hashed links, making
+  # this a superset of the real directory rather than a replacement for it.
+  caCertDir = pkgs.runCommandLocal "netskope-ca-hashed" { } ''
+    mkdir -p $out
+    cd $out
+    # `openssl rehash` skips any file that does not hold exactly one certificate, so
+    # cut strictly between the BEGIN/END markers -- the human-readable labels the
+    # bundle puts between certificates would otherwise ride along and be rejected.
+    awk '/-----BEGIN CERTIFICATE-----/ { n++; f = sprintf("ca-%04d.pem", n) }
+         f { print > f }
+         /-----END CERTIFICATE-----/ { f = "" }' ${config.security.pki.caBundle}
+    ${pkgs.openssl.bin}/bin/openssl rehash $out
+    ln -s ${config.security.pki.caBundle} ca-bundle.crt
+    ln -s ${config.security.pki.caBundle} ca-certificates.crt
+  '';
 in
 {
   options.services.netskope = {
@@ -121,14 +157,21 @@ in
 
     tenantHost = lib.mkOption {
       type = lib.types.str;
-      default = if cfg.tenant == null then "" else "addon-${cfg.tenant}.goskope.com";
-      defaultText = lib.literalExpression ''"addon-<tenant>.goskope.com" when `tenant` is set, else ""'';
-      example = "addon-<tenant>.goskope.com";
+      default = if cfg.tenant == null then "" else "${cfg.tenant}.goskope.com";
+      defaultText = lib.literalExpression ''"<tenant>.goskope.com" when `tenant` is set, else ""'';
+      example = "<tenant>.goskope.com";
       description = ''
-        Tenant enrollment host (the addon/gateway host). Maps to the client's
-        -H/--tenantHostname. Defaults to addon-<tenant>.goskope.com when `tenant`
-        is set; override for regional variants. Leave empty to package the client
-        without declarative enrollment.
+        Tenant hostname -- the client's -H/--tenantHostname. This is the BARE tenant
+        host (`corp.goskope.com`), NOT the addon host: the client derives the addon
+        host itself by prefixing `addon-`. Passing `addon-corp.goskope.com` here
+        makes it look up `addon-addon-corp.goskope.com`, which resolves nothing and
+        fails enrollment with a DNS error ("Could not resolve hostname") -- verified
+        on a real host, and asserted against below, because Windows deployment
+        strings put the *addon* host in `host=` and are the obvious thing to copy.
+
+        Defaults to <tenant>.goskope.com when `tenant` is set; override for regional
+        variants (eu./de./au.goskope.com). Leave empty to package the client without
+        declarative enrollment.
       '';
     };
 
@@ -170,16 +213,25 @@ in
       email = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
         default = null;
+        example = "user@example.com";
         description = ''
-          Optional user email for email-mode enrollment (-m/--email). Not needed
-          when enrolling with an org key + auth token.
+          User email for email-mode enrollment (-m/--email). Set either this or
+          `upn`: an org key + auth token alone is NOT enough. With both unset the
+          client silently picks UPN mode, tries to derive the AD domain by running
+          `realm list`, and fails ("Can't find domain from: realm list") on any host
+          that is not domain-joined -- so on a typical NixOS box this is the option
+          that makes enrollment work. Verified against a live tenant.
         '';
       };
 
       upn = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
         default = null;
-        description = "Optional UPN for non-domain-joined enrollment (-u/--upn).";
+        description = ''
+          UPN for enrollment (-u/--upn), as an alternative to `email`. Note that UPN
+          mode resolves the AD domain through realmd's `realm list`, so it needs a
+          domain-joined host with realmd installed; prefer `email` otherwise.
+        '';
       };
     };
 
@@ -203,8 +255,16 @@ in
     #
     #   #9   option-schema polish (client source: requireFile / URL / tenant) + a
     #        NixOS VM test
-    #   #10  build + runtime verification on a real Nix host (this was authored
-    #        without Nix; the enrollment handshake in particular is unverified)
+    #   #10  build + runtime verification on a real Nix host
+    #
+    # The enrollment handshake has now been exercised against the live tenant on a
+    # real host (installerutil run against a throwaway copy of the app dir in a user
+    # namespace, so no system state was touched): it returns "Successfully downloaded
+    # branding file by email id" and writes nsbranding.json.enc. Getting there fixed
+    # four defects in this module, each documented at its site: the addon- prefix in
+    # tenantHost, the empty MyRunFileName, the missing email/upn, and the unusable
+    # OpenSSL CApath. What remains unverified is what happens AFTER the branding file
+    # lands -- the daemon's own secure-enrollment (usercert) and steering setup.
     # ------------------------------------------------------------------
 
     assertions = [
@@ -219,6 +279,18 @@ in
       {
         assertion = (enr.orgKeyFile != null) -> (cfg.tenantHost != "");
         message = "services.netskope.enrollment.orgKeyFile is set but services.netskope.tenantHost is empty — set the tenant host.";
+      }
+      {
+        # Catches the copy-from-Windows mistake: `host=addon-corp.goskope.com` in a
+        # Windows deployment string is the addon host, but the client prefixes
+        # `addon-` itself, so passing it through yields addon-addon-corp.goskope.com
+        # and enrollment dies on DNS. Fail at eval instead.
+        assertion = !(lib.hasPrefix "addon-" cfg.tenantHost);
+        message = "services.netskope.tenantHost is \"${cfg.tenantHost}\" — drop the `addon-` prefix and use the bare tenant hostname (e.g. corp.goskope.com). The client derives the addon host itself, so this would resolve addon-${cfg.tenantHost} and fail enrollment with \"Could not resolve hostname\".";
+      }
+      {
+        assertion = enrollmentConfigured -> (enr.email != null || enr.upn != null);
+        message = "services.netskope.enrollment needs `email` (or `upn`) alongside orgKeyFile/authTokenFile. With neither set the client falls back to UPN mode and resolves the AD domain via `realm list`, which fails on a host that is not domain-joined — enrollment then never completes.";
       }
     ];
 
@@ -349,6 +421,10 @@ in
         # the copy at this path (not the store) for the IPC peer check -- see
         # netskope-setup.service.
         WorkingDirectory = "/opt/netskope/stagent";
+        # Without this every request the client makes fails TLS verification -- see
+        # caCertDir above for why NixOS' /etc/ssl/certs is unusable as an OpenSSL
+        # CApath.
+        BindReadOnlyPaths = [ "${caCertDir}:/etc/ssl/certs" ];
         LoadCredential = [
           "orgkey:${enr.orgKeyFile}"
         ]
@@ -361,9 +437,13 @@ in
 
         # Idempotency marker. install.sh treats the downloaded branding file as the
         # "enroll config ready" signal (isEnrollConfigReady), so that is what we
-        # check. NB: an earlier version of this unit looked for a `.eetk` token --
-        # that string does not appear in any shipped binary, so the guard never
-        # fired and enrollment re-ran on every boot.
+        # check. NB: an earlier version of this unit looked for a `.eetk` token.
+        # There IS such a file -- the client stats $appPath/.eetk.enc on every
+        # enrollment attempt -- but the name is composed at runtime and appears in no
+        # binary's string table, and it is a secure-enrollment token cache rather
+        # than an "already enrolled" marker, so it is the wrong thing to gate on.
+        # A successful enrollment writes nsbranding.json.enc (encrypted branding is
+        # the default on a modern tenant), hence all three names below.
         if [ -e "$appPath/nsbranding.json" ] \
           || [ -e "$appPath/nsbranding.json.enc" ] \
           || [ -e "$appPath/nsidpconfig.json" ]; then
@@ -380,7 +460,14 @@ in
         report="enroll.$$"
 
         # install.sh's enrollment envelope, verbatim field set.
-        json="{\"LoginUser\":\"root\",\"ReportFileName\":\"$report\",\"MyRunFileName\":\"\",\"TenantHostname\":\"${cfg.tenantHost}\",\"Orgkey\":\"$orgkey\",\"UserEmail\":\"${optStr enr.email}\",\"UserUpn\":\"${optStr enr.upn}\",\"IdpMode\":\"\",\"TenantName\":\"\",\"TenantDomain\":\"\",\"EnrollAuthToken\":\"$authtoken\",\"EnrollEncryptToken\":\"$encrypttoken\",\"InstallTags\":\"\"}"
+        #
+        # MyRunFileName must be NON-EMPTY. installerutil validates the field before
+        # doing anything else and bails with "Invalid options, MyRunFileName not
+        # found!" (exit 1, not a single packet sent) when it is "" -- which is how
+        # this unit used to fail. Upstream passes the path of the NSClient.run that
+        # unpacked itself; nothing ever opens the file (verified with a path that
+        # does not exist), so a stable placeholder is all it wants.
+        json="{\"LoginUser\":\"root\",\"ReportFileName\":\"$report\",\"MyRunFileName\":\"$appPath/NSClient.run\",\"TenantHostname\":\"${cfg.tenantHost}\",\"Orgkey\":\"$orgkey\",\"UserEmail\":\"${optStr enr.email}\",\"UserUpn\":\"${optStr enr.upn}\",\"IdpMode\":\"\",\"TenantName\":\"\",\"TenantDomain\":\"\",\"EnrollAuthToken\":\"$authtoken\",\"EnrollEncryptToken\":\"$encrypttoken\",\"InstallTags\":\"\"}"
 
         "$appPath/installerutil" "--download_branding_file" "$json"
 
@@ -419,6 +506,10 @@ in
         # hard-coded /opt/netskope/stagent state lookups resolve to writable dirs.
         ExecStart = "/opt/netskope/stagent/stAgentSvc";
         WorkingDirectory = "/opt/netskope/stagent";
+        # The daemon re-fetches branding, config and the tenant CA on its own
+        # schedule, all over TLS, and needs the same rehashed trust dir the enroll
+        # unit does (see caCertDir).
+        BindReadOnlyPaths = [ "${caCertDir}:/etc/ssl/certs" ];
         Restart = "always";
         RestartSec = 10;
       };

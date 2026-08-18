@@ -40,9 +40,19 @@ exposes it as a NixOS module. Planning and decisions are tracked as a
 > configuration** — it trusts the copy the client downloads for itself, and follows CA
 > rotation. See [Trusting the tenant CA](#trusting-the-tenant-ca--without-putting-it-in-your-config).
 >
+> A seventh and eighth came from a laptop that docks and roams: the client's
+> **DNS-cache flush never once ran** (two more missing `/usr/sbin` tools, while the
+> layer above it logged success), and `.local` resolution stayed **pinned to the DNS
+> servers of the network the tunnel started on**, because `sta0` outlives an uplink
+> change and the unit that configures it sampled them once. See
+> [Switching networks](#switching-networks).
+>
 > Not yet verified on a host: that combination in one run. The rpfilter fix and the
 > steering behaviour above are measured; runtime CA trust is covered by the VM test but
-> has not yet been through a live steering session.
+> has not yet been through a live steering session. The flush fix is so far only
+> structural — the tools are in the namespace and the VM test asserts it, but nothing
+> has yet watched `Flush DNS command: …` replace `Flush DNS command not found!` on a
+> real host.
 
 ## Quick start
 
@@ -173,10 +183,14 @@ That took some proving: with `iproute2` on the unit's PATH the daemon still logg
 `Command ip not found!`, and it still did with `/usr/bin/ip` in place. Only `/usr/sbin/ip`
 silenced it.
 
-It wants `ip`, `iptables`, `ip6tables`, `dmidecode` and `resolvectl`; everything else in
-its string table (`dpkg`, `rpm`, `realm`, `pgrep`, `traceroute`, …) goes unused here.
-One name is deliberately *withheld*: `update-ca-certificates`, whose presence would
-send the CA installer down its Debian branch (see [Tenant CA install](#tenant-ca-install)).
+It wants `ip`, `iptables`, `ip6tables`, `dmidecode`, `resolvectl`, `systemd-resolve`,
+`pidof` and `sysctl`; everything else in its string table (`dpkg`, `rpm`, `realm`,
+`pgrep`, `traceroute`, …) goes unused here. One name is deliberately *withheld*:
+`update-ca-certificates`, whose presence would send the CA installer down its Debian
+branch (see [Tenant CA install](#tenant-ca-install)).
+
+The last three arrived later than the rest, from chasing [network switching](#switching-networks),
+and two of them exist only to make the DNS-cache flush work at all.
 
 `ip` is the one that matters, and losing it fails in a way that is easy to misread:
 
@@ -291,6 +305,69 @@ anyone doing this by hand:
 
 Even then the client cleans up nothing when killed, so the harness removes the
 `fwmark` rule, flushes table 9, deletes `sta0` and restarts `firewall.service` itself.
+
+## Switching networks
+
+A laptop that docks, undocks and roams between wifi networks changes its uplink
+underneath a tunnel that does not go anywhere. `sta0` belongs to the tunnel, not to the
+uplink, and it **outlives an uplink change** — which turned up two defects, both
+NixOS-specific and both invisible unless you read the client's own log.
+
+**The DNS cache was never flushed.** The client flushes the resolver cache when the
+network changes, which is the one moment it really has to: answers learned from the
+network you just left are worse than no answers. On this host every attempt failed,
+and the layer above it reported success anyway:
+
+```
+npaTunnelMgr.cpp:2175  System DNS cache is flushed, when NPA set domain and IP rules.
+nsNetTool.cpp:540      NetTool Flush DNS command not found!
+```
+
+Two different missing tools, one per flush path. `linux/flushDns.cpp` knows about
+`resolvectl flush-caches`, but gates the whole thing on `pidof systemd-resolved` — and
+with `pidof` absent the looked-up path comes back empty, so the composed command
+collapses onto its own argument and the journal shows the shell being handed the
+daemon's name:
+
+```
+stAgentSvc[2818]: sh: line 1: systemd-resolved: command not found
+```
+
+…after which it concludes `skip flushDNS since systemd-resolved is not running`, on a
+host where resolved is the only resolver there is. `nsNetTool`'s own flush, meanwhile,
+wants the pre-v239 `systemd-resolve` name; having `resolvectl` does not satisfy it.
+Both are now in `fhsTools`, along with `sysctl` — `npaTunnelMgr` reads
+`sysctl -n net.core.{r,w}mem_max` to size the Private Access tunnel's socket buffers
+and was falling back to defaults after the same kind of failure
+(`sh: line 1: sysctl: command not found`).
+
+**`.local` resolution was pinned to the network it started on.** `netskope-npa-dns`
+copies the uplink's DNS servers onto `sta0` (see [The tunnel device](#the-tunnel-device));
+as a oneshot triggered by `sta0` appearing, it sampled them exactly once. Measured on a
+real host, docking moved the client's uplink three times in twenty seconds and
+re-enumerated the dock's NIC (`eth0` ifindex 6 → 7):
+
+```
+nsDnsMgr.cpp:927  Uplink DNS 10.2.75.10 OIF wlp2s0/4 -> eth0/6; rebuilding socket
+nsDnsMgr.cpp:927  Uplink DNS 10.2.75.10 OIF eth0/6 -> wlp2s0/4; rebuilding socket
+nsDnsMgr.cpp:927  Uplink DNS 10.2.75.10 OIF wlp2s0/4 -> eth0/7; rebuilding socket
+```
+
+`sta0` stayed up through all of it and the unit never re-ran. Dock to wifi and the
+servers on `sta0` are the ones the *docked* network handed out — normally unreachable
+from the new one — so Private Access names go to a dead resolver while every other
+symptom looks healthy. The unit now applies once, reports ready, and then follows
+`ip monitor link address route` for the life of the tunnel: it coalesces the burst a
+single dock swap produces, reconfigures resolved only when the (uplink, servers) pair
+actually changes, and re-checks every 60s regardless, since `ip monitor` drops messages
+on receive-buffer overrun. Mid-switch moments with no default route or no lease yet
+leave the previous setting alone rather than tearing `.local` down for a blip — another
+event is always coming.
+
+One thing that looks like a defect and is not: `nsRtNetlink ipRouteGet: failed to get
+response`, four of them after every network-change event, from the bypass-route
+handler. They are IPv6 route lookups on a host with no IPv6 route — `ip route get` on a
+global v6 address answers `Network is unreachable` by hand too.
 
 ## Options
 

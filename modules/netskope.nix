@@ -69,8 +69,44 @@ let
     # Device make/model/serial reported to the tenant; falls back to sysfs, but the
     # daemon probes for it on every config cycle.
     ln -s ${pkgs.dmidecode}/bin/dmidecode $out/dmidecode
-    # Flushing the DNS cache when steering changes.
+    # Flushing the DNS cache when steering changes -- or when the network does, which
+    # is the case that matters most: the whole point of the flush is to drop answers
+    # learned from the network you just left.
+    #
+    # resolvectl alone is NOT enough, and the failure is silent in the worst way.
+    # Verified on a real host: EVERY flush attempt failed,
+    #
+    #   nsNetTool.cpp:540  NetTool Flush DNS command not found!
+    #
+    # while npaTunnelMgr logged "System DNS cache is flushed" right above it -- it
+    # never checks the result. So the resolver cache was flushed exactly never, on a
+    # machine whose own logs claimed otherwise. The client has two flush paths, and
+    # each was missing a different tool:
+    #
+    #  * linux/flushDns.cpp searches /usr/bin and /usr/sbin for `systemd-resolve
+    #    --flush-caches` and `resolvectl flush-caches` -- but gates the whole thing on
+    #    `pidof systemd-resolved`. With pidof absent the looked-up path comes back
+    #    empty and the composed command collapses onto its own argument, which is
+    #    precisely what the journal shows the shell being handed:
+    #
+    #      stAgentSvc[2818]: sh: line 1: systemd-resolved: command not found
+    #
+    #    ...so it concludes "skip flushDNS since systemd-resolved is not running" on a
+    #    host where resolved is running and is the only resolver there is.
+    #  * nsNetTool's own flush wants the pre-v239 `systemd-resolve` name; resolvectl
+    #    being present does not satisfy it. It is a symlink to resolvectl inside the
+    #    same systemd package, so naming it here costs nothing.
     ln -s ${config.systemd.package}/bin/resolvectl $out/resolvectl
+    ln -s ${config.systemd.package}/bin/systemd-resolve $out/systemd-resolve
+    ln -s ${pkgs.procps}/bin/pidof $out/pidof
+    # Socket buffers for the Private Access tunnel: npaTunnelMgr reads
+    # `sysctl -n net.core.{r,w}mem_max` and writes back with `sysctl -w`. Another
+    # bare-name call that fails on NixOS --
+    #
+    #   stAgentSvc[2603]: sh: line 1: sysctl: command not found
+    #
+    # -- leaving the tunnel on whatever the defaults happen to be.
+    ln -s ${pkgs.procps}/bin/sysctl $out/sysctl
   '';
 
   # Which trust store the client's own units get.
@@ -550,6 +586,22 @@ in
     #
     # NB: the client rejects AAAA queries for these names ("Unsupported DNS Flags"),
     # which is its own quirk and not fatal -- resolved uses the A answer.
+    #
+    # The servers are a property of the network the laptop is ON, so this cannot be a
+    # oneshot that samples them once. sta0 belongs to the tunnel, not to the uplink,
+    # and it OUTLIVES an uplink change -- measured on a real host, where docking moved
+    # the client's uplink between wifi and ethernet three times in twenty seconds and
+    # re-enumerated the dock's NIC (eth0 ifindex 6 -> 7):
+    #
+    #   nsDnsMgr.cpp:927  Uplink DNS 10.2.75.10 OIF wlp2s0/4 -> eth0/6; rebuilding socket
+    #   nsDnsMgr.cpp:927  Uplink DNS 10.2.75.10 OIF eth0/6 -> wlp2s0/4; rebuilding socket
+    #   nsDnsMgr.cpp:927  Uplink DNS 10.2.75.10 OIF wlp2s0/4 -> eth0/7; rebuilding socket
+    #
+    # ...through all of which sta0 stayed up and the sampled-once unit never re-ran.
+    # Dock to wifi and the servers pinned here are the ones the docked network handed
+    # out -- typically unreachable from the new one -- so `.local` names go to a dead
+    # resolver and Private Access resolution stops, while everything else looks fine.
+    # So: apply, then follow the network for as long as the tunnel lives.
     systemd.services.netskope-npa-dns = {
       description = "Route .local names to the Netskope tunnel resolver";
       # sta0 exists only while the tunnel is up, which is exactly when this should
@@ -558,29 +610,79 @@ in
       after = [ "sys-subsystem-net-devices-sta0.device" ];
       wantedBy = [ "sys-subsystem-net-devices-sta0.device" ];
       serviceConfig = {
-        Type = "oneshot";
-        RemainAfterExit = true;
+        # notify, not simple: the unit is only meaningfully up once `.local` actually
+        # routes somewhere, and NotifyAccess=all because the readiness ping comes from
+        # a child of the shell rather than the shell itself.
+        Type = "notify";
+        NotifyAccess = "all";
+        # If `ip monitor` dies the tunnel is still up and still needs following.
+        # BindsTo means a deliberate stop (sta0 going away) is not restarted.
+        Restart = "always";
+        RestartSec = 5;
       };
       script = ''
         set -eu
         resolvectl=${config.systemd.package}/bin/resolvectl
+        ip=${pkgs.iproute2}/bin/ip
 
-        link="$(${pkgs.iproute2}/bin/ip -o route show default | ${pkgs.gawk}/bin/awk '{print $5; exit}')"
-        if [ -z "$link" ]; then
-          echo "netskope: no default route; leaving Private Access DNS alone" >&2
-          exit 0
-        fi
-        servers="$("$resolvectl" dns "$link" | ${pkgs.gnused}/bin/sed 's/^[^:]*: *//')"
-        if [ -z "$servers" ]; then
-          echo "netskope: $link has no DNS servers; leaving Private Access DNS alone" >&2
-          exit 0
-        fi
+        applied=""
 
-        # Unquoted on purpose: resolvectl takes the servers as separate arguments.
-        # shellcheck disable=SC2086
-        "$resolvectl" dns sta0 $servers
-        "$resolvectl" domain sta0 '~local'
-        echo "netskope: .local routed via sta0 -> $servers" >&2
+        apply() {
+          # The uplink, never sta0 itself: the client puts a default route on the
+          # tunnel in its own table, and pointing sta0's resolver at sta0 would be a
+          # loop. (Skipping it here rather than relying on the main table staying
+          # clean, since that is the client's to change, not ours.)
+          link="$("$ip" -o route show default \
+            | ${pkgs.gawk}/bin/awk '$5 != "sta0" { print $5; exit }')"
+          if [ -z "$link" ]; then
+            echo "netskope: no default route; leaving Private Access DNS alone" >&2
+            return 0
+          fi
+          servers="$("$resolvectl" dns "$link" | ${pkgs.gnused}/bin/sed 's/^[^:]*: *//')"
+          if [ -z "$servers" ]; then
+            echo "netskope: $link has no DNS servers; leaving Private Access DNS alone" >&2
+            return 0
+          fi
+          # Mid-switch there is a moment with no uplink or no lease yet. Both branches
+          # above leave the previous setting in place rather than tearing `.local` down
+          # for a blip -- correct only because another event is coming to fix it.
+          if [ "$link $servers" = "$applied" ]; then
+            return 0
+          fi
+          # Unquoted on purpose: resolvectl takes the servers as separate arguments.
+          # shellcheck disable=SC2086
+          "$resolvectl" dns sta0 $servers
+          "$resolvectl" domain sta0 '~local'
+          applied="$link $servers"
+          echo "netskope: .local routed via sta0 -> $servers (uplink $link)" >&2
+        }
+
+        apply
+        ${config.systemd.package}/bin/systemd-notify --ready
+
+        # Follow the uplink for the life of the tunnel. Events only ever trigger the
+        # comparison in apply(), so a busy link is cheap and a redundant wakeup is
+        # free.
+        "$ip" monitor link address route | while :; do
+          # Wake on a netlink event, or every 60s regardless: `ip monitor` drops
+          # messages on receive-buffer overrun and prints its own complaint, and a
+          # dropped one would otherwise strand `.local` on the old network's resolver
+          # until the tunnel next came up. The poll is the backstop, the events are
+          # what make it converge in seconds.
+          rc=0
+          read -r -t 60 _ || rc=$?
+          # A status above 128 is the timeout firing; anything else non-zero is EOF,
+          # i.e. `ip monitor` is gone. Leave and let Restart bring both back, rather
+          # than spinning on a dead pipe.
+          if [ "$rc" -ne 0 ] && [ "$rc" -le 128 ]; then
+            break
+          fi
+          # One dock swap is dozens of link/address/route messages, and the client
+          # rebuilds its own bypass routes on top of them. Drain the burst and apply
+          # once it has settled, so resolved is reconfigured at most once per change.
+          while read -r -t 2 _; do :; done
+          apply
+        done
       '';
     };
 
@@ -826,6 +928,7 @@ in
         pkgs.iproute2
         pkgs.iptables
         pkgs.dmidecode
+        pkgs.procps # sysctl and pidof, both invoked as bare names through a shell
       ];
       serviceConfig = {
         Type = "simple";

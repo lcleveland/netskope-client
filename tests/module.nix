@@ -210,11 +210,10 @@ pkgs.testers.runNixOSTest {
     # client's sockets whose local address is no longer configured, which the client
     # recovers from in ~1.3s.
     #
-    # What that unit does when it finds one cannot be exercised here: it needs a real
-    # stAgentSvc holding a real socket, and this test runs a stub. So assert the two
-    # things that are testable, the second of which is the dangerous direction --
-    # sweeping must be a no-op when every address is valid, and must never touch a
-    # socket that is not the client's.
+    # Killing a socket the client owns needs a real stAgentSvc, so that stays a host
+    # check. What IS testable is every way the sweep can be wrong about a socket it
+    # must leave alone -- which is the dangerous direction, and where this unit was in
+    # fact broken.
     machine.wait_for_unit("netskope-tunnel-rebind.service")
     machine.succeed(
         "socat -u TCP-LISTEN:9999,bind=127.0.0.1,fork,reuseaddr /dev/null "
@@ -224,6 +223,35 @@ pkgs.testers.runNixOSTest {
         # Still there: the sweep ran (Type=notify, so the restart returned only once it
         # had) and left a healthy socket that is not the client's alone.
         "ss -Htn state established '( sport = :9999 or dport = :9999 )' | grep -q ."
+    )
+
+    # And a socket that IS the client's, on an address that is still configured, must
+    # survive too. This is the case that shipped broken: the client binds every tunnel
+    # socket to its uplink device, ss renders such a socket as ADDR%IFNAME:PORT, and
+    # comparing that qualified form against `ip addr` never matches -- so the sweep
+    # closed every socket the client had, on a healthy uplink, every 60s, bouncing the
+    # tunnel it was written to keep up.
+    #
+    # Reproducing it needs all three properties together: a process ss reports as
+    # stAgentSvc (the sweep greps for it), a socket bound to a device, and a local
+    # address that is still present. A copy of socat under the client's name supplies
+    # the first, so-bindtodevice=lo the second.
+    machine.succeed("cp $(readlink -f $(type -P socat)) /tmp/stAgentSvc")
+    machine.succeed(
+        "/tmp/stAgentSvc -u TCP-LISTEN:9998,bind=127.0.0.1,fork,reuseaddr /dev/null "
+        ">/dev/null 2>&1 & sleep 1; "
+        "sleep infinity | /tmp/stAgentSvc - TCP:127.0.0.1:9998,so-bindtodevice=lo "
+        ">/dev/null 2>&1 & sleep 2; "
+        # Precondition, not decoration: if the socket is not actually device-bound, or
+        # not actually attributed to stAgentSvc, the assertion below proves nothing.
+        "ss -Htnp state established '( sport = :9998 or dport = :9998 )' "
+        "| grep -q '127.0.0.1%lo' && "
+        "ss -Htnp state established '( sport = :9998 or dport = :9998 )' "
+        "| grep -q stAgentSvc"
+    )
+    machine.succeed("systemctl restart netskope-tunnel-rebind.service")
+    machine.succeed(
+        "ss -Htn state established '( sport = :9998 or dport = :9998 )' | grep -q ."
     )
 
     # Removing the tunnel takes both followers with it, rather than leaving resolved

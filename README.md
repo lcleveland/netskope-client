@@ -60,10 +60,15 @@ exposes it as a NixOS module. Planning and decisions are tracked as a
 > `Flushed all caches.`), and `.local` follows the uplink across a real dock swap,
 > including the no-DNS-yet blip and the tunnel being torn down under it.
 >
-> Not yet verified on a host: `netskope-tunnel-rebind`, which is new — the VM test can
-> only prove it leaves healthy sockets alone, since exercising the kill needs a real
-> `stAgentSvc`. Nor the whole combination in one run; runtime CA trust is covered by the
-> VM test but has not yet been through a live steering session.
+> `netskope-tunnel-rebind` has since been verified on a host, and its first version was
+> wrong in the one direction that matters. `ss` renders a device-bound socket as
+> `ADDR%IFNAME:PORT`, the client device-binds every tunnel socket, and that qualifier was
+> never stripped before the address was checked against `ip addr` — so the sweep judged
+> every *healthy* socket dead and closed it, once a minute, bouncing the tunnel it exists
+> to keep up. Fixed; the VM test now covers a device-bound socket on a live address.
+>
+> Not yet verified on a host: the whole combination in one run; runtime CA trust is
+> covered by the VM test but has not yet been through a live steering session.
 
 ## Quick start
 
@@ -438,6 +443,30 @@ in which closing it loses something. It is narrow on both axes deliberately: onl
 addresses absent from `ip addr` (not "the old uplink", since an address can survive an
 uplink change), and only the client's own sockets, matched through `ss -p` — a NixOS
 module has no business reaping other software's sockets, however dead they are.
+
+Parsing that socket list is the subtle part, and it is where the first version of this
+unit was wrong. `ss` renders the local end of a device-bound socket as
+`ADDR%IFNAME:PORT`, and the client binds *every* tunnel socket to its uplink device — it
+has to, or the traffic carrying the tunnel would route back into the tun that tunnel
+installs. Stripping only the port leaves `10.2.192.202%eth0`, which matches nothing in
+`ip addr`, so the sweep condemned every socket the client had:
+
+```
+netskope: closed tunnel socket 10.2.192.202%eth0:49898 -> 162.10.127.32:443;
+          its source address is gone
+```
+
+— on a host whose `ip addr` listed `10.2.192.202` on `eth0` the entire time. The 60s
+backstop made it periodic, and because the client's recovery is prompt the visible result
+was a tunnel rebuilt and torn down again roughly once a minute: the exact bounce this unit
+exists to prevent, caused by this unit. The interface qualifier is now stripped before the
+comparison, and the VM test covers a device-bound socket on a live address — reproducing
+the same log line against the old code.
+
+Reporting needs the same care. `ss -K` exits 0 whether it destroyed a socket, matched
+nothing, or was refused permission, so the log line is keyed off what it *printed*
+(`-H`, so an empty stdout means nothing matched) rather than its exit status — otherwise
+it repeats the DNS flush's mistake of logging a success it never had.
 
 Two things that look like defects and are not: `ipRouteGet: failed to get response`,
 four per network-change event, are IPv6 lookups on a host with no IPv6 route — `ip route

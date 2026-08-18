@@ -772,11 +772,37 @@ in
               case "$local" in
                 *:*:*) continue ;;
               esac
+              # ss renders the local end of a device-bound socket as ADDR%IFNAME:PORT,
+              # and the client binds EVERY tunnel socket to its uplink device -- it has
+              # to, or the traffic carrying the tunnel would route back into the tun that
+              # tunnel installs. So the qualifier is present on all of them, and it has to
+              # come off before the comparison below. Comparing the qualified form against
+              # `ip addr` cannot succeed for any socket the client owns, which is how this
+              # unit came to condemn every HEALTHY socket it found:
+              #
+              #   netskope: closed tunnel socket 10.2.192.202%eth0:49898 ->
+              #             162.10.127.32:443; its source address is gone
+              #
+              # on a host whose `ip addr` listed 10.2.192.202 on eth0 the entire time. The
+              # 60s backstop then made it periodic, and since the client's recovery IS
+              # prompt the result was a tunnel that rebuilt and was torn down again about
+              # once a minute -- the exact bounce this unit exists to prevent, caused by
+              # this unit.
+              lport=''${local##*:}
+              laddr=''${local%:*}
+              laddr=''${laddr%%"%"*}
+              [ -n "$laddr" ] || continue
               case "$addrs" in
-                *" ''${local%:*} "*) continue ;;
+                *" $laddr "*) continue ;;
               esac
-              if "$ss" -K state established src "$local" dst "$peer" >/dev/null 2>&1; then
-                echo "netskope: closed tunnel socket $local -> $peer; its source address is gone" >&2
+              # `ss -K` exits 0 whether it destroyed a socket, matched nothing, or was
+              # refused permission -- all three verified -- so its status cannot be what
+              # we report on; that is how the DNS flush managed to log a success it never
+              # had. It does print what it matched, and -H leaves stdout empty when that
+              # is nothing, so key the message off the output instead. stderr is
+              # deliberately not swallowed, so a real failure still reaches the journal.
+              if [ -n "$("$ss" -HKtn state established src "$laddr:$lport" dst "$peer")" ]; then
+                echo "netskope: closed tunnel socket $local -> $peer; source address $laddr is no longer configured" >&2
               fi
             done
         }

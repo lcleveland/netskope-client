@@ -217,12 +217,10 @@ pkgs.testers.runNixOSTest {
     # not on PATH, which is why systemd.services.*.path does not help. Without it the
     # tunnel connects and only then does the filter device fail, leaving a daemon that
     # looks healthy while steering nothing.
-    # The DNS-cache flush needs three of these, not just resolvectl: nsNetTool asks for
-    # the older `systemd-resolve` name, and flushDns.cpp gates its own attempt on
-    # `pidof systemd-resolved` -- with pidof missing the composed command collapses to
-    # `systemd-resolved` and the client decides resolved is not running. Without them
-    # every flush logs "Flush DNS command not found!" while the layer above it logs
-    # success, so the cache survives the network change it was meant to be cleared for.
+    # ...and it wants each tool in the directory FHS would keep it in, so both halves
+    # are populated. Shipping only /usr/sbin left every /usr/bin tool invisible --
+    # `resolvectl`, `systemd-resolve` and `pidof` all present under /usr/sbin and on
+    # PATH, and the DNS flush still reporting "Flush DNS command not found!".
     for tool in [
         "ip",
         "iptables",
@@ -233,8 +231,15 @@ pkgs.testers.runNixOSTest {
         "pidof",
         "sysctl",
     ]:
-        machine.succeed(f"nsenter --mount --target {pid} test -x /usr/sbin/{tool}")
+        for d in ["/usr/bin", "/usr/sbin"]:
+            machine.succeed(f"nsenter --mount --target {pid} test -x {d}/{tool}")
     machine.succeed(f"nsenter --mount --target {pid} /usr/sbin/ip -V")
+
+    # Whether the flush then WORKS cannot be asserted here: this test runs a stub
+    # daemon, and the failure mode lives entirely inside the real client's tool lookup.
+    # It has to be read off nsdebuglog on a host -- "Flush DNS command: ..." replacing
+    # "Flush DNS command not found!" -- which is why that check is in the README rather
+    # than in this file.
 
     # None of that may leak onto the host: these paths exist only in the namespace.
     machine.fail("test -e /usr/bin/update-ca-trust")

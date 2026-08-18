@@ -41,18 +41,19 @@ exposes it as a NixOS module. Planning and decisions are tracked as a
 > rotation. See [Trusting the tenant CA](#trusting-the-tenant-ca--without-putting-it-in-your-config).
 >
 > A seventh and eighth came from a laptop that docks and roams: the client's
-> **DNS-cache flush never once ran** (two more missing `/usr/sbin` tools, while the
-> layer above it logged success), and `.local` resolution stayed **pinned to the DNS
-> servers of the network the tunnel started on**, because `sta0` outlives an uplink
-> change and the unit that configures it sampled them once. See
-> [Switching networks](#switching-networks).
+> **DNS-cache flush never once ran** (missing tools, while the layer above it logged
+> success), and `.local` resolution stayed **pinned to the DNS servers of the network
+> the tunnel started on**, because `sta0` outlives an uplink change and the unit that
+> configures it sampled them once. See [Switching networks](#switching-networks). The
+> flush also settled a rule that had been half-right since the beginning: the client
+> wants each helper in the directory FHS would keep it in, so `fhsTools` is bound at
+> `/usr/bin` *and* `/usr/sbin` — see [Runtime tools](#runtime-tools).
 >
 > Not yet verified on a host: that combination in one run. The rpfilter fix and the
 > steering behaviour above are measured; runtime CA trust is covered by the VM test but
-> has not yet been through a live steering session. The flush fix is so far only
-> structural — the tools are in the namespace and the VM test asserts it, but nothing
-> has yet watched `Flush DNS command: …` replace `Flush DNS command not found!` on a
-> real host.
+> has not yet been through a live steering session. The flush is verified only in the
+> negative so far — `/usr/sbin` alone provably did *not* fix it on a real host, and the
+> `/usr/bin` half is one rebuild away from being confirmed there.
 
 ## Quick start
 
@@ -176,21 +177,33 @@ form — which is what `caCertFile` needs, and the installer ships no CA.
 
 ## Runtime tools
 
-The daemon shells out to a handful of commands and looks for them at **`/usr/sbin/<name>`**
-— *not* through `PATH`. `systemd.services.stagentd.path` therefore does nothing for it;
-the commands are bound into `/usr/sbin` inside the unit's namespace instead (`fhsTools`).
-That took some proving: with `iproute2` on the unit's PATH the daemon still logged
-`Command ip not found!`, and it still did with `/usr/bin/ip` in place. Only `/usr/sbin/ip`
-silenced it.
+The daemon shells out to a handful of commands and looks for them by **absolute FHS
+path** — *not* through `PATH`. `systemd.services.stagentd.path` is therefore not
+sufficient on its own; the commands are bound into the unit's namespace instead
+(`fhsTools`). That took some proving: with `iproute2` on the unit's PATH the daemon still
+logged `Command ip not found!`, and it still did with `/usr/bin/ip` in place. Only
+`/usr/sbin/ip` silenced it.
+
+And it wants each tool in the directory a real FHS distro would keep it in, which is why
+`fhsTools` is bound at **both** `/usr/bin` and `/usr/sbin`. Populating only `/usr/sbin`
+got `ip`, `iptables`, `ip6tables`, `dmidecode` and `sysctl` working while every
+`/usr/bin` tool stayed invisible: `resolvectl`, `systemd-resolve` and `pidof` were all
+present under `/usr/sbin` *and* on PATH, and the DNS flush still reported
+`Flush DNS command not found!` on a host where `pidof systemd-resolved` answers
+instantly from any other shell. Two directories of symlinks cost nothing; guessing one
+per tool gets it wrong half the time.
 
 It wants `ip`, `iptables`, `ip6tables`, `dmidecode`, `resolvectl`, `systemd-resolve`,
 `pidof` and `sysctl`; everything else in its string table (`dpkg`, `rpm`, `realm`,
 `pgrep`, `traceroute`, …) goes unused here. One name is deliberately *withheld*:
 `update-ca-certificates`, whose presence would send the CA installer down its Debian
-branch (see [Tenant CA install](#tenant-ca-install)).
+branch (see [Tenant CA install](#tenant-ca-install)). `update-ca-trust`, the RHEL tool
+it *does* call, lives in `fhsTools` too rather than in a bind of its own — a file bind
+over a path inside a read-only directory bind needs the file to exist in it first.
 
-The last three arrived later than the rest, from chasing [network switching](#switching-networks),
-and two of them exist only to make the DNS-cache flush work at all.
+The last three tools arrived later than the rest, from chasing
+[network switching](#switching-networks), and two of them exist only to make the
+DNS-cache flush work at all.
 
 `ip` is the one that matters, and losing it fails in a way that is easy to misread:
 
@@ -323,23 +336,32 @@ npaTunnelMgr.cpp:2175  System DNS cache is flushed, when NPA set domain and IP r
 nsNetTool.cpp:540      NetTool Flush DNS command not found!
 ```
 
-Two different missing tools, one per flush path. `linux/flushDns.cpp` knows about
-`resolvectl flush-caches`, but gates the whole thing on `pidof systemd-resolved` — and
-with `pidof` absent the looked-up path comes back empty, so the composed command
-collapses onto its own argument and the journal shows the shell being handed the
-daemon's name:
+Three names are involved. `linux/flushDns.cpp` composes either `systemd-resolve
+--flush-caches` or `resolvectl flush-caches`, and gates both on
+`pidof systemd-resolved` — which is where the one remaining shell error comes from,
+since a failed lookup leaves the composed command as nothing but its argument:
 
 ```
 stAgentSvc[2818]: sh: line 1: systemd-resolved: command not found
 ```
 
-…after which it concludes `skip flushDNS since systemd-resolved is not running`, on a
-host where resolved is the only resolver there is. `nsNetTool`'s own flush, meanwhile,
-wants the pre-v239 `systemd-resolve` name; having `resolvectl` does not satisfy it.
-Both are now in `fhsTools`, along with `sysctl` — `npaTunnelMgr` reads
-`sysctl -n net.core.{r,w}mem_max` to size the Private Access tunnel's socket buffers
-and was falling back to defaults after the same kind of failure
-(`sh: line 1: sysctl: command not found`).
+…whereupon it concludes `skip flushDNS since systemd-resolved is not running`, on a host
+where resolved is the only resolver there is. `systemd-resolve` is the pre-v239 name and
+a symlink to `resolvectl` in the same package, so naming it costs nothing.
+
+**The first attempt at this fixed only half of it, which is what pinned down the
+directory rule.** Adding all three under `/usr/sbin`, plus `procps` on the unit's PATH,
+silenced `sysctl: command not found` completely — and changed nothing about the flush.
+`resolvectl`, `systemd-resolve` and `pidof` were all sitting in `/usr/sbin` and on PATH,
+`pidof systemd-resolved` answered instantly from any other shell on the box, and the
+daemon still logged `Flush DNS command not found!` on every attempt. They are `/usr/bin`
+tools on an FHS distro; `ip` and `sysctl` are `/usr/sbin` ones. `fhsTools` is now bound
+at both paths — see [Runtime tools](#runtime-tools).
+
+`sysctl` came along for the ride: `npaTunnelMgr` reads
+`sysctl -n net.core.{r,w}mem_max` to size the Private Access tunnel's socket buffers and
+was falling back to defaults after the same kind of failure
+(`sh: line 1: sysctl: command not found`, now gone).
 
 **`.local` resolution was pinned to the network it started on.** `netskope-npa-dns`
 copies the uplink's DNS servers onto `sta0` (see [The tunnel device](#the-tunnel-device));

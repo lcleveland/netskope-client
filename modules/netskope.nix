@@ -703,6 +703,104 @@ in
       '';
     };
 
+    # Rebinding the tunnel after an uplink change.
+    #
+    # The client does not notice that its uplink went away. It keeps the steering
+    # tunnel bound to the source address the old link had, and only rebuilds when its
+    # own TLS keepalive finally expires -- measured on a real host across two undocks,
+    # 2m14s and 2m07s:
+    #
+    #   10:18:33  [undock; the DNS unit above reacts within the second]
+    #   10:18:46  npa keepAlive fails with 15 tries
+    #   10:20:47  tunnel.cpp:447   TLS received nsssl_closed, tunnel destroyed
+    #   10:20:48  tunnelMgr.cpp:1147  Primary tunnel source IP: 10.20.35.126
+    #
+    # The symptom is specific and easy to misattribute: DNS keeps working, because
+    # nsDnsMgr rebuilds its own uplink sockets on the change event within
+    # milliseconds, while everything on 80/443 goes through the tunnel and hangs. The
+    # client's flow log fills up while it does -- attempts went from 61 per 30s before
+    # the undock to 296 during it, a retry storm rather than traffic. Bypass routes are
+    # collateral: nsBypassRouteHandler sees every change event and rebuilds nothing
+    # (its deletes all fail, since the kernel already purged the routes with the dead
+    # link), so table 9 is only repaired when the tunnel is.
+    #
+    # None of that is reachable through configuration -- the keepalive interval lives
+    # in the tenant's encrypted config, and stAgentCli exposes no knob for it.
+    #
+    # But the client's RECOVERY is prompt: 1.3s from seeing the socket close to a
+    # tunnel on the new uplink, routes and all. Only the detection is slow. So detect
+    # it for the client: when an address disappears, close any of its sockets still
+    # bound to one. A socket whose local address is no longer configured cannot carry
+    # traffic under any circumstances, which is what makes this safe rather than a
+    # heuristic -- there is no state in which killing it loses something.
+    #
+    # Deliberately narrow, on both axes:
+    #  * Only sockets whose local address is absent from `ip addr`. Not "sockets on the
+    #    old uplink" -- an address can survive an uplink change, and this must not fire
+    #    on a metric change or a second link appearing.
+    #  * Only the client's own sockets, matched through `ss -p`. A NixOS module has no
+    #    business reaping other software's sockets, however dead they are.
+    systemd.services.netskope-tunnel-rebind = {
+      description = "Rebind the Netskope tunnel after an uplink change";
+      # Same lifecycle as the DNS unit: relevant exactly while a tunnel exists.
+      bindsTo = [ "sys-subsystem-net-devices-sta0.device" ];
+      after = [ "sys-subsystem-net-devices-sta0.device" ];
+      wantedBy = [ "sys-subsystem-net-devices-sta0.device" ];
+      serviceConfig = {
+        Type = "notify";
+        NotifyAccess = "all";
+        Restart = "always";
+        RestartSec = 5;
+      };
+      script = ''
+        set -eu
+        ip=${pkgs.iproute2}/bin/ip
+        ss=${pkgs.iproute2}/bin/ss
+
+        sweep() {
+          # Every address currently configured anywhere, padded so the match below
+          # cannot hit a substring (10.2.192.20 inside 10.2.192.202).
+          addrs=" $("$ip" -o addr show | ${pkgs.gawk}/bin/awk '{ split($4, a, "/"); print a[1] }' \
+            | tr '\n' ' ')"
+
+          # -H drops the header; columns are Recv-Q Send-Q Local Peer Process.
+          "$ss" -Htnp state established 2>/dev/null \
+            | ${pkgs.gnugrep}/bin/grep -F 'stAgentSvc' \
+            | while read -r _ _ local peer _; do
+              # IPv4 only: the client's tunnel is v4, and stripping a port off a
+              # bracketed v6 literal needs different handling than this.
+              case "$local" in
+                *:*:*) continue ;;
+              esac
+              case "$addrs" in
+                *" ''${local%:*} "*) continue ;;
+              esac
+              if "$ss" -K state established src "$local" dst "$peer" >/dev/null 2>&1; then
+                echo "netskope: closed tunnel socket $local -> $peer; its source address is gone" >&2
+              fi
+            done
+        }
+
+        sweep
+        ${config.systemd.package}/bin/systemd-notify --ready
+
+        # Addresses are what matter here, but link events arrive alongside them on a
+        # dock swap and cost nothing to wake on.
+        "$ip" monitor address link | while :; do
+          rc=0
+          read -r -t 60 _ || rc=$?
+          if [ "$rc" -ne 0 ] && [ "$rc" -le 128 ]; then
+            break
+          fi
+          # Let the burst settle before looking: mid-swap the old address may be gone
+          # while the new one has not arrived, and there is nothing to gain from
+          # sweeping twice. The client only needs one close to start rebuilding.
+          while read -r -t 2 _; do :; done
+          sweep
+        done
+      '';
+    };
+
     # The client rewrites its anchors when the tenant rotates its CA. Rebuild then,
     # rather than only at boot; the mount picks the new contents up in place.
     systemd.paths.netskope-ca-trust = lib.mkIf cfg.trustCA {

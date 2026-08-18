@@ -49,11 +49,21 @@ exposes it as a NixOS module. Planning and decisions are tracked as a
 > wants each helper in the directory FHS would keep it in, so `fhsTools` is bound at
 > `/usr/bin` *and* `/usr/sbin` — see [Runtime tools](#runtime-tools).
 >
-> Not yet verified on a host: that combination in one run. The rpfilter fix and the
-> steering behaviour above are measured; runtime CA trust is covered by the VM test but
-> has not yet been through a live steering session. The flush is verified only in the
-> negative so far — `/usr/sbin` alone provably did *not* fix it on a real host, and the
-> `/usr/bin` half is one rebuild away from being confirmed there.
+> A ninth is the one an actual user notices, and it hid behind the other two: after an
+> undock **DNS keeps working while nothing on 80/443 loads**, for slightly over two
+> minutes, because the client leaves its tunnel bound to the source address of the
+> uplink that went away and waits for its own keepalive to expire. `netskope-tunnel-rebind`
+> closes the dead socket for it; the client then recovers in 1.3s.
+>
+> Measured on a host: the flush now runs (`Flush DNS command:
+> /usr/bin/systemd-resolve --flush-caches`, with systemd-resolved's own log confirming
+> `Flushed all caches.`), and `.local` follows the uplink across a real dock swap,
+> including the no-DNS-yet blip and the tunnel being torn down under it.
+>
+> Not yet verified on a host: `netskope-tunnel-rebind`, which is new — the VM test can
+> only prove it leaves healthy sockets alone, since exercising the kill needs a real
+> `stAgentSvc`. Nor the whole combination in one run; runtime CA trust is covered by the
+> VM test but has not yet been through a live steering session.
 
 ## Quick start
 
@@ -386,10 +396,55 @@ on receive-buffer overrun. Mid-switch moments with no default route or no lease 
 leave the previous setting alone rather than tearing `.local` down for a blip — another
 event is always coming.
 
-One thing that looks like a defect and is not: `nsRtNetlink ipRouteGet: failed to get
-response`, four of them after every network-change event, from the bypass-route
-handler. They are IPv6 route lookups on a host with no IPv6 route — `ip route get` on a
-global v6 address answers `Network is unreachable` by hand too.
+**The tunnel keeps the old uplink's source address for two minutes.** This is the one a
+user actually notices, and it presents misleadingly: *DNS works but pages will not
+load*. Measured across two undocks, 2m14s and 2m07s:
+
+```
+10:18:33  [undock; netskope-npa-dns reacts within the second]
+10:18:46  neClientTransportHandler.cpp:69   keepAlive fails with 15 tries
+10:20:47  tunnel.cpp:447      TLS received nsssl_closed, tunnel destroyed
+10:20:48  tunnelMgr.cpp:1147  Primary tunnel source IP: 10.20.35.126   ← wifi, at last
+```
+
+The client does not act on the uplink change at all; it waits for its own TLS keepalive
+to expire. DNS survives because `nsDnsMgr` rebuilds its uplink sockets on the change
+event within milliseconds, while everything on 80/443 goes to a tunnel bound to an
+address that no longer exists. The client's flow log fills up while it does — attempts
+went from 61 per 30s before the undock to **296** during it, which is a retry storm, not
+traffic. Read carelessly, that graph looks like health.
+
+Bypass routes are collateral of the same root cause rather than a separate defect.
+`nsBypassRouteHandler` sees every change event and rebuilds nothing — its deletes all
+fail, because the kernel already purged those routes along with the dead link —
+
+```
+nsRtNetlink ipRouteDel: failed to get response for 4.39.19.82     ← the POP
+nsRtNetlink ipRouteDel: failed to get response for 10.0.0.0/8
+nsRtNetlink ipRouteDel: failed to get response for 100.64.0.0/10  ... 19 in all
+```
+
+— and no adds follow. Table 9 is repaired only when the tunnel is rebuilt, so it heals
+on the same two-minute clock.
+
+None of this is reachable through configuration: the keepalive interval lives in the
+tenant's encrypted config and `stAgentCli` exposes no knob for it. But the client's
+*recovery* is prompt — 1.3s from seeing the socket close to a tunnel on the new uplink,
+routes and all. Only the detection is slow. So `netskope-tunnel-rebind` detects it for
+the client: on an address change it closes any of the client's sockets still bound to a
+local address that is no longer configured. Such a socket cannot carry traffic under any
+circumstances, which is what makes this safe rather than a heuristic — there is no state
+in which closing it loses something. It is narrow on both axes deliberately: only
+addresses absent from `ip addr` (not "the old uplink", since an address can survive an
+uplink change), and only the client's own sockets, matched through `ss -p` — a NixOS
+module has no business reaping other software's sockets, however dead they are.
+
+Two things that look like defects and are not: `ipRouteGet: failed to get response`,
+four per network-change event, are IPv6 lookups on a host with no IPv6 route — `ip route
+get` on a global v6 address answers `Network is unreachable` by hand too. And
+`stAgentCli` refusing to connect is usually the caller's fault: the IPC layer rejects
+peers whose `LD_LIBRARY_PATH` holds a `/nix/store` path as code injection, so run it as
+`env -u LD_LIBRARY_PATH stAgentCli show-status`.
 
 ## Options
 

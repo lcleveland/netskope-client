@@ -187,6 +187,20 @@ pkgs.testers.runNixOSTest {
     machine.succeed(f"resolvectl domain {link} | grep -qv '~local'")
     machine.succeed(f"resolvectl dns {link} | grep -q 192.0.2.53")
 
+    # Docking, or moving to wifi, changes the uplink's DNS servers while sta0 -- which
+    # belongs to the tunnel, not the uplink -- stays exactly where it is. Sampling the
+    # servers once would strand `.local` on the resolver of the network that has been
+    # left behind, so the unit follows netlink for as long as the tunnel lives. Change
+    # the servers WITHOUT touching the unit, and they must follow on their own.
+    machine.succeed(f"resolvectl dns {link} 192.0.2.54")
+    # Nudge netlink the way a real uplink change does: the DNS servers themselves are
+    # invisible to `ip monitor`, and a dock swap always brings address/route churn with
+    # it. (The 60s poll would catch it regardless -- that is the backstop, not the path
+    # under test here.)
+    machine.succeed(f"ip addr add 192.0.2.1/32 dev {link}")
+    machine.wait_until_succeeds("resolvectl dns sta0 | grep -q 192.0.2.54")
+    machine.succeed("resolvectl domain sta0 | grep -q '~local'")
+
     # Removing the tunnel takes the routing domain with it, rather than leaving
     # resolved pointing `.local` at an interface that no longer exists.
     machine.succeed("ip link del sta0")
@@ -203,7 +217,22 @@ pkgs.testers.runNixOSTest {
     # not on PATH, which is why systemd.services.*.path does not help. Without it the
     # tunnel connects and only then does the filter device fail, leaving a daemon that
     # looks healthy while steering nothing.
-    for tool in ["ip", "iptables", "ip6tables", "dmidecode", "resolvectl"]:
+    # The DNS-cache flush needs three of these, not just resolvectl: nsNetTool asks for
+    # the older `systemd-resolve` name, and flushDns.cpp gates its own attempt on
+    # `pidof systemd-resolved` -- with pidof missing the composed command collapses to
+    # `systemd-resolved` and the client decides resolved is not running. Without them
+    # every flush logs "Flush DNS command not found!" while the layer above it logs
+    # success, so the cache survives the network change it was meant to be cleared for.
+    for tool in [
+        "ip",
+        "iptables",
+        "ip6tables",
+        "dmidecode",
+        "resolvectl",
+        "systemd-resolve",
+        "pidof",
+        "sysctl",
+    ]:
         machine.succeed(f"nsenter --mount --target {pid} test -x /usr/sbin/{tool}")
     machine.succeed(f"nsenter --mount --target {pid} /usr/sbin/ip -V")
 

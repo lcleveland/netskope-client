@@ -47,14 +47,27 @@ let
     ln -s ${config.security.pki.caBundle} ca-certificates.crt
   '';
 
-  # The helper commands the daemon shells out to, at the one path it looks for them.
+  # The helper commands the daemon shells out to, at the paths it looks for them.
   #
-  # It resolves them as /usr/sbin/<name>, NOT through PATH. That was established the
+  # It resolves them by absolute FHS path, NOT through PATH. That was established the
   # hard way, by running the daemon against a throwaway copy of its app dir and
   # watching nsdebuglog: with iproute2 on the unit's PATH it still logged "Command ip
   # not found!", and it still did with /usr/bin/ip in place; adding /usr/sbin/ip is
   # what silenced it and let "reset stAgent route rules" run. (systemd.services.*.path
-  # is therefore useless here -- it was tried, shipped, and did nothing.)
+  # is therefore not sufficient here -- it was tried, shipped, and did nothing for the
+  # lookups, though a few bare-name shell calls do still need it. Set both.)
+  #
+  # And it wants each tool in the directory a real FHS distro would put it in, which is
+  # why this is bound at BOTH /usr/bin and /usr/sbin. Shipping only /usr/sbin got `ip`,
+  # `iptables`, `ip6tables`, `dmidecode` and `sysctl` working while every /usr/bin tool
+  # stayed invisible -- `resolvectl`, `systemd-resolve` and `pidof` were all present
+  # under /usr/sbin and PATH, and the DNS flush still reported
+  #
+  #   nsNetTool.cpp:540  NetTool Flush DNS command not found!
+  #
+  # on a host where `pidof systemd-resolved` answers instantly from any other shell.
+  # One directory populated per tool guesses wrong half the time; two costs nothing,
+  # since the whole thing is symlinks.
   #
   # Deliberately absent: update-ca-certificates. Its presence would send the CA
   # installer down its Debian branch, into a /usr/local/share/ca-certificates that
@@ -80,22 +93,21 @@ let
     #
     # while npaTunnelMgr logged "System DNS cache is flushed" right above it -- it
     # never checks the result. So the resolver cache was flushed exactly never, on a
-    # machine whose own logs claimed otherwise. The client has two flush paths, and
-    # each was missing a different tool:
+    # machine whose own logs claimed otherwise.
     #
-    #  * linux/flushDns.cpp searches /usr/bin and /usr/sbin for `systemd-resolve
-    #    --flush-caches` and `resolvectl flush-caches` -- but gates the whole thing on
-    #    `pidof systemd-resolved`. With pidof absent the looked-up path comes back
-    #    empty and the composed command collapses onto its own argument, which is
-    #    precisely what the journal shows the shell being handed:
+    # Three names, because the client has two flush paths and a gate in front of them:
+    # linux/flushDns.cpp composes `systemd-resolve --flush-caches` or
+    # `resolvectl flush-caches`, and gates both on `pidof systemd-resolved` -- which is
+    # also the source of the one shell error that outlived the first attempt at this
+    # fix, since a failed lookup leaves the composed command as just its argument:
     #
-    #      stAgentSvc[2818]: sh: line 1: systemd-resolved: command not found
+    #   stAgentSvc[2818]: sh: line 1: systemd-resolved: command not found
     #
-    #    ...so it concludes "skip flushDNS since systemd-resolved is not running" on a
-    #    host where resolved is running and is the only resolver there is.
-    #  * nsNetTool's own flush wants the pre-v239 `systemd-resolve` name; resolvectl
-    #    being present does not satisfy it. It is a symlink to resolvectl inside the
-    #    same systemd package, so naming it here costs nothing.
+    # ...whereupon it decides "skip flushDNS since systemd-resolved is not running", on
+    # a host where resolved is the only resolver there is. `systemd-resolve` is the
+    # pre-v239 name and a symlink to resolvectl in the same package, so naming it costs
+    # nothing. All three are /usr/bin tools on an FHS distro, which is the other half
+    # of this -- see the directory note above.
     ln -s ${config.systemd.package}/bin/resolvectl $out/resolvectl
     ln -s ${config.systemd.package}/bin/systemd-resolve $out/systemd-resolve
     ln -s ${pkgs.procps}/bin/pidof $out/pidof
@@ -107,6 +119,11 @@ let
     #
     # -- leaving the tunnel on whatever the defaults happen to be.
     ln -s ${pkgs.procps}/bin/sysctl $out/sysctl
+    # The RHEL trust-store refresh tool the CA installer calls after dropping its
+    # anchors (see the CA notes on stagentd.service). It lives in here rather than in a
+    # bind of its own because this directory now IS /usr/bin, and a file bind over a
+    # path inside a read-only directory bind needs the file to exist in it first.
+    ln -s ${caTrustShim} $out/update-ca-trust
   '';
 
   # Which trust store the client's own units get.
@@ -983,7 +1000,10 @@ in
         #    -- and stAgentCli reports only "Internet Security disabled due to error".
         BindReadOnlyPaths = [
           "${clientCertDir}:/etc/ssl/certs"
-          "${caTrustShim}:/usr/bin/update-ca-trust"
+          # Both, because the client wants each tool where FHS would keep it, and
+          # picking one directory per tool guesses wrong -- see fhsTools. It carries
+          # update-ca-trust for the /usr/bin half rather than binding that separately.
+          "${fhsTools}:/usr/bin"
           "${fhsTools}:/usr/sbin"
         ];
         BindPaths = [ "${cfg.statePath}/ca-anchors:/etc/pki/ca-trust/source/anchors" ];

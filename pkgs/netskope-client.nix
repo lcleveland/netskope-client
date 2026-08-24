@@ -39,7 +39,7 @@
 }:
 
 let
-  version = "140.0.2.2763";
+  version = "140.1.0.2781";
 
   # Client source resolution, in priority order:
   #   1. explicit `srcOverride` (path/derivation)
@@ -75,7 +75,7 @@ let
   # Offline / air-gapped fallback. This sha256 is the lselectric v140 build.
   requireFileSrc = requireFile {
     name = "NSClient.run";
-    sha256 = "94e02c57eff357528d641ada0f0f2a6bb9cbe120eed061f7c21a3b7e02e14132";
+    sha256 = "36c4c752e49fb0a453f667522fb338d8cad1f6575cd5f28f23f589807723b400";
     message = ''
       No client source configured. Either set `tenant` (+ `hash`) to fetch it, or
       supply NSClient.run offline. It is proprietary and tenant-specific; obtain it:
@@ -87,8 +87,8 @@ let
 
         nix-store --add-fixed sha256 NSClient.run
 
-      Expected sha256 (lselectric, v140.0.2.2763):
-        94e02c57eff357528d641ada0f0f2a6bb9cbe120eed061f7c21a3b7e02e14132
+      Expected sha256 (lselectric, v140.1.0.2781):
+        36c4c752e49fb0a453f667522fb338d8cad1f6575cd5f28f23f589807723b400
     '';
   };
 

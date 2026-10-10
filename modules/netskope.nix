@@ -1166,6 +1166,12 @@ in
         wantedBy = lib.optional cfg.autoStart "graphical-session.target";
         partOf = [ "graphical-session.target" ];
         after = [ "graphical-session.target" ];
+        # Not in a display manager's own session. greetd's greeter (a system user,
+        # uid 996 here) reaches graphical-session.target too, and stAgentApp there
+        # registers the greeter as a client session (sessId = uid). The daemon then
+        # parks the NPA tunnel on that session and keeps it after the greeter exits,
+        # so the real user's ZTNA flaps until stagentd is restarted.
+        unitConfig.ConditionUser = "!@system";
         serviceConfig = {
           Type = "simple";
           ExecStart = "/opt/netskope/stagent/stAgentApp";
@@ -1188,6 +1194,7 @@ in
           "graphical-session.target"
           "stagentapp.service"
         ];
+        unitConfig.ConditionUser = "!@system";
         serviceConfig = {
           Type = "simple";
           ExecStart = "/opt/netskope/stagent/stAgentUI";

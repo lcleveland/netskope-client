@@ -72,7 +72,7 @@ let
         // (if lib.hasInfix "-" hash then { inherit hash; } else { sha256 = hash; })
       );
 
-  # Offline / air-gapped fallback. This sha256 is the corp v141.1.7.2827 build.
+  # Offline / air-gapped fallback. This sha256 is the author's v141.1.7.2827 build.
   requireFileSrc = requireFile {
     name = "NSClient.run";
     sha256 = "128ddb8658b47ba0da72fa1bdcc35c87fd5067a85fe8959c945c7fd75d6ab712";
@@ -87,7 +87,7 @@ let
 
         nix-store --add-fixed sha256 NSClient.run
 
-      Expected sha256 (corp, v141.1.7.2827):
+      Expected sha256 (author's tenant, v141.1.7.2827):
         128ddb8658b47ba0da72fa1bdcc35c87fd5067a85fe8959c945c7fd75d6ab712
     '';
   };

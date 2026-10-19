@@ -82,7 +82,7 @@ exposes it as a NixOS module. Planning and decisions are tracked as a
 
   services.netskope = {
     enable = true;
-    tenant = "corp";  # fetches the installer from the tenant (public, no auth)
+    tenant = "corp";        # fetches the installer from the tenant (public, no auth)
     hash = "sha256-lOAsV+/zV1KNZBraDw8qa7nL4SDu0GH3who7fgLhQTI="; # bump on version change
 
     enrollment = {

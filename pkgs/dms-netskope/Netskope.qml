@@ -38,8 +38,20 @@ PluginComponent {
     property string actionTitle: ""
     property string actionOutput: ""
 
+    // Set when the tenant refuses `stAgentCli enable|disable` (allowClientDisabling),
+    // cleared by the next one it accepts.
+    property bool steeringLocked: false
+
     // show-status wording is not documented, so read it loosely and show it verbatim.
     readonly property bool clientEnabled: daemonUp && /enabled/i.test(statusText) && !/disabled/i.test(statusText)
+
+    // Under the steering switch: why it cannot move, else the client's own state,
+    // which also covers the tenant turning steering off ("disabled by administrator").
+    readonly property string steeringDescription: {
+        if (steeringLocked)
+            return "Your tenant does not allow changing this from the client";
+        return statusText.split("\n")[0] || "Web traffic through the Netskope tunnel";
+    }
 
     readonly property color statusColor: {
         if (!daemonUp)
@@ -119,6 +131,8 @@ PluginComponent {
             root.busy = false;
             const out = root.clean(actionStdout.text + "\n" + actionStderr.text);
             root.actionOutput = out !== "" ? out : (exitCode === 0 ? "Done." : "Failed (exit " + exitCode + ").");
+            if (["enable", "disable"].includes(actionProcess.command[actionProcess.command.length - 1]))
+                root.steeringLocked = /not permitted by admin/i.test(out);
             root.refresh();
         }
     }
@@ -174,6 +188,18 @@ PluginComponent {
                         checked: root.daemonUp
                         enabled: !root.busy
                         onToggled: checked => root.setDaemon(checked)
+                    }
+
+                    // Bound to the reported state, so a refused change snaps back.
+                    DToggle {
+                        width: parent.width
+                        text: "Steering"
+                        description: root.steeringDescription
+                        descriptionColor: root.steeringLocked ? Theme.warning : Theme.surfaceVariantText
+                        checked: root.clientEnabled
+                        enabled: !root.busy
+                        visible: root.daemonUp
+                        onToggled: checked => root.run(checked ? "Turning steering on" : "Turning steering off", root.cli.concat([checked ? "enable" : "disable"]))
                     }
 
                     StyledRect {
@@ -234,13 +260,6 @@ PluginComponent {
                         width: parent.width
                         spacing: Theme.spacingS
                         visible: root.daemonUp
-
-                        DButton {
-                            text: root.clientEnabled ? "Disable client" : "Enable client"
-                            iconName: root.clientEnabled ? "pause_circle" : "play_circle"
-                            enabled: !root.busy
-                            onClicked: root.run(text, root.cli.concat([root.clientEnabled ? "disable" : "enable"]))
-                        }
 
                         DButton {
                             text: "Save logs"

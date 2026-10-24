@@ -67,9 +67,10 @@ PluginComponent {
         return clientEnabled ? "On" : "Daemon running, client not enabled";
     }
 
-    // stAgentCli opens every run with this line.
+    // stAgentCli opens every run with "start process..." (a varying number of dots)
+    // and prints rows of dots while it retries its connection.
     function clean(text) {
-        return text.split("\n").filter(l => l.trim() !== "start process...").join("\n").trim();
+        return text.split("\n").filter(l => !/^(start process)?\.*$/.test(l.trim())).join("\n").trim();
     }
 
     function refresh() {
@@ -146,7 +147,6 @@ PluginComponent {
     }
 
     popoutWidth: 460
-    popoutHeight: 560
 
     horizontalBarPill: Component {
         DankIcon {
@@ -284,13 +284,13 @@ PluginComponent {
                         }
                     }
 
-                    // Output of the last action. Selectable, so it can be copied.
+                    // Output of the last action: grows to fit, then scrolls (blocked
+                    // events and configuration can run long). Selectable for copying.
                     StyledRect {
                         width: parent.width
-                        height: Math.min(220, actionText.implicitHeight + Theme.spacingS * 2 + actionLabel.implicitHeight)
+                        height: actionLabel.implicitHeight + Math.min(240, actionText.implicitHeight) + Theme.spacingS * 3
                         color: Theme.surfaceContainerHigh
                         radius: Theme.cornerRadius
-                        clip: true
                         visible: root.actionTitle !== ""
 
                         StyledText {
@@ -304,20 +304,30 @@ PluginComponent {
                             font.pixelSize: Theme.fontSizeSmall
                         }
 
-                        TextEdit {
-                            id: actionText
+                        DFlickable {
+                            id: actionFlick
 
                             anchors.left: parent.left
                             anchors.right: parent.right
                             anchors.top: actionLabel.bottom
+                            anchors.bottom: parent.bottom
                             anchors.margins: Theme.spacingS
-                            text: root.actionOutput
-                            color: Theme.surfaceText
-                            font.pixelSize: Theme.fontSizeSmall
-                            font.family: "monospace"
-                            readOnly: true
-                            selectByMouse: true
-                            wrapMode: TextEdit.Wrap
+                            contentWidth: width
+                            contentHeight: actionText.implicitHeight
+                            clip: true
+
+                            TextEdit {
+                                id: actionText
+
+                                width: actionFlick.width
+                                text: root.actionOutput
+                                color: Theme.surfaceText
+                                font.pixelSize: Theme.fontSizeSmall
+                                font.family: "monospace"
+                                readOnly: true
+                                selectByMouse: true
+                                wrapMode: TextEdit.Wrap
+                            }
                         }
                     }
 

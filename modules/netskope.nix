@@ -1226,8 +1226,11 @@ in
     systemd.user.services = lib.mkIf cfg.enableTray {
       stagentapp = {
         description = "Netskope client tray agent (watchdog)";
-        # No point drawing a tray for a daemon that is not running -- see autoStart.
-        wantedBy = lib.optional cfg.autoStart "graphical-session.target";
+        # Always, not just with autoStart: this registers the login session with the
+        # daemon. Without it a daemon started later logs "Failed to get Active User
+        # Session ID", leaves Internet Security disabled, and refuses stAgentCli. It
+        # idles while the daemon is down and reconnects when it starts (verified).
+        wantedBy = [ "graphical-session.target" ];
         partOf = [ "graphical-session.target" ];
         after = [ "graphical-session.target" ];
         # Not in a display manager's own session. greetd's greeter (a system user,

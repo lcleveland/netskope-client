@@ -248,12 +248,22 @@ in
 
     trayIcon = lib.mkOption {
       type = lib.types.bool;
-      default = !cfg.dmsWidget.enable;
-      defaultText = lib.literalExpression "!config.services.netskope.dmsWidget.enable";
+      default = true;
       description = ''
         Run Netskope's own GTK tray icon (`stagentui`). Needs `enableTray`, whose
-        `stagentapp` session agent keeps running either way. Off by default when the
-        DankMaterialShell widget replaces it.
+        `stagentapp` session agent keeps running either way. Turn it off when
+        `dmsWidget` replaces it.
+      '';
+    };
+
+    allowDaemonControl = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Let active local `wheel` users start and stop `stagentd.service` without a
+        password (a polkit rule). Stopping the daemon is the one off switch that
+        always works: the tenant can forbid turning steering off from the client
+        (allowClientDisabling=false), but not this.
       '';
     };
 
@@ -263,11 +273,9 @@ in
         default = false;
         description = ''
           Build a DankMaterialShell bar widget that does what the native tray menu
-          does (status, enable/disable, save logs, blocked events, configuration,
-          version) and adds an on/off switch for the `stagentd` daemon itself. The
-          switch works through a polkit rule, added with this option, that lets
-          active local `wheel` users start and stop `stagentd.service` without a
-          password.
+          does (status, steering on/off, save logs, blocked events, configuration,
+          version) and adds an on/off switch for the `stagentd` daemon itself, which
+          needs `allowDaemonControl` to work without a password prompt.
 
           This only builds the plugin (`dmsWidget.package`); register it with your
           DMS setup under the id `netskope` and add that id to a bar.
@@ -1195,9 +1203,9 @@ in
       };
     };
 
-    # The DMS widget's on/off switch: `systemctl start|stop stagentd` from the
-    # session, without a password, for active local wheel users only.
-    security.polkit.extraConfig = lib.mkIf cfg.dmsWidget.enable ''
+    # allowDaemonControl: `systemctl start|stop stagentd` from the session (the DMS
+    # widget's switch, or a terminal) without a password, active local wheel only.
+    security.polkit.extraConfig = lib.mkIf cfg.allowDaemonControl ''
       polkit.addRule(function(action, subject) {
         if (action.id == "org.freedesktop.systemd1.manage-units" &&
             action.lookup("unit") == "stagentd.service" &&

@@ -484,8 +484,9 @@ peers whose `LD_LIBRARY_PATH` holds a `/nix/store` path as code injection, so ru
 | `package` | override the built package |
 | `statePath` (default `/var/lib/netskope`) | all mutable client state; the one path to persist |
 | `enableTray` (default `true`) | tray UI: `stagentapp` (watchdog) + `stagentui` (icon) user services + launcher entry |
-| `trayIcon` (default `!dmsWidget.enable`) | Netskope's own GTK tray icon (`stagentui`) + its launcher entry |
-| `dmsWidget.enable` (default `false`) | build a DankMaterialShell bar widget (`dmsWidget.package`, plugin id `netskope`) with a daemon on/off switch; adds a polkit rule letting active local wheel users start/stop `stagentd` |
+| `trayIcon` (default `true`) | Netskope's own GTK tray icon (`stagentui`) + its launcher entry |
+| `allowDaemonControl` (default `true`) | polkit rule letting active local wheel users start/stop `stagentd` without a password |
+| `dmsWidget.enable` (default `false`) | build a DankMaterialShell bar widget (`dmsWidget.package`, plugin id `netskope`): status, steering and daemon switches, logs, blocked events |
 | `tenantHost` | tenant hostname, **not** the addon host (defaults to `<tenant>.goskope.com`) |
 | `enrollment.{orgKeyFile,authTokenFile,encryptTokenFile,email,upn}` | enrollment params |
 | `trustCA` | trust the tenant CA system-wide, from the client's own runtime copy |

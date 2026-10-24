@@ -138,8 +138,9 @@ PluginComponent {
         }
     }
 
+    // A poll is three stAgentCli calls, ~2s each, per bar; actions refresh at once.
     Timer {
-        interval: 10000
+        interval: 30000
         repeat: true
         running: true
         triggeredOnStart: true
@@ -149,7 +150,7 @@ PluginComponent {
     popoutWidth: 460
 
     horizontalBarPill: Component {
-        DankIcon {
+        DIcon {
             name: root.daemonUp ? "vpn_lock" : "vpn_key_off"
             size: root.iconSize
             color: root.statusColor
@@ -157,7 +158,7 @@ PluginComponent {
     }
 
     verticalBarPill: Component {
-        DankIcon {
+        DIcon {
             name: root.daemonUp ? "vpn_lock" : "vpn_key_off"
             size: root.iconSize
             color: root.statusColor
@@ -222,7 +223,7 @@ PluginComponent {
                                 spacing: Theme.spacingS
                                 visible: root.userEmail !== ""
 
-                                DankIcon {
+                                DIcon {
                                     name: "person"
                                     size: Theme.iconSizeSmall
                                     color: Theme.surfaceText

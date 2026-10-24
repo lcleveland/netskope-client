@@ -31,6 +31,8 @@ PluginComponent {
     property bool daemonUp: false
     property string statusText: ""
     property string paText: ""
+    // The user the client is enrolled as, from show-config's "User Email:".
+    property string userEmail: ""
     property bool everChecked: false
     property bool busy: false
     property string actionTitle: ""
@@ -82,7 +84,7 @@ PluginComponent {
     Process {
         id: statusProcess
 
-        command: ["sh", "-c", "if systemctl is-active --quiet stagentd.service; then echo up; " + root.cli.join(" ") + " show-status 2>&1; echo @@PA@@; " + root.cli.join(" ") + " show-pa 2>&1; else echo down; fi"]
+        command: ["sh", "-c", "if systemctl is-active --quiet stagentd.service; then echo up; " + root.cli.join(" ") + " show-status 2>&1; echo @@NEXT@@; " + root.cli.join(" ") + " show-pa 2>&1; echo @@NEXT@@; " + root.cli.join(" ") + " show-config 2>&1; else echo down; fi"]
         running: false
 
         stdout: StdioCollector {
@@ -91,10 +93,12 @@ PluginComponent {
 
         onExited: {
             const text = statusOutput.text;
-            const parts = text.substring(text.indexOf("\n") + 1).split("@@PA@@");
+            const parts = text.substring(text.indexOf("\n") + 1).split("@@NEXT@@");
             root.daemonUp = text.startsWith("up");
             root.statusText = root.daemonUp ? root.clean(parts[0]) : "";
             root.paText = root.daemonUp ? root.clean(parts[1] ?? "") : "";
+            const email = /User Email:\s*(\S+)/.exec(parts[2] ?? "");
+            root.userEmail = root.daemonUp && email ? email[1] : "";
             root.everChecked = true;
         }
     }
@@ -187,6 +191,25 @@ PluginComponent {
                             anchors.top: parent.top
                             anchors.margins: Theme.spacingM
                             spacing: Theme.spacingXS
+
+                            Row {
+                                spacing: Theme.spacingS
+                                visible: root.userEmail !== ""
+
+                                DankIcon {
+                                    name: "person"
+                                    size: Theme.iconSizeSmall
+                                    color: Theme.surfaceText
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
+
+                                StyledText {
+                                    text: root.userEmail
+                                    color: Theme.surfaceText
+                                    font.pixelSize: Theme.fontSizeSmall
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
+                            }
 
                             StyledText {
                                 width: parent.width

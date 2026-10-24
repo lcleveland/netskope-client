@@ -1,0 +1,12 @@
+{
+  "id": "netskope",
+  "name": "Netskope Client",
+  "description": "Netskope client status and controls, plus an on/off switch for its daemon",
+  "version": "1.0.0",
+  "author": "netskope-client",
+  "icon": "vpn_lock",
+  "type": "widget",
+  "capabilities": ["dankbar-widget", "monitoring"],
+  "component": "./Netskope.qml",
+  "permissions": ["process"]
+}

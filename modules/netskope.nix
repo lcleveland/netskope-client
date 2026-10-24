@@ -242,8 +242,49 @@ in
       description = ''
         Build and run the per-user tray UI: the `stagentapp` (watchdog) and `stagentui`
         (tray icon) user services, plus a launcher entry. Disable on headless hosts to
-        drop the heavy GTK/WebKit closure.
+        drop the heavy GTK/WebKit closure. `trayIcon` turns off just the icon.
       '';
+    };
+
+    trayIcon = lib.mkOption {
+      type = lib.types.bool;
+      default = !cfg.dmsWidget.enable;
+      defaultText = lib.literalExpression "!config.services.netskope.dmsWidget.enable";
+      description = ''
+        Run Netskope's own GTK tray icon (`stagentui`). Needs `enableTray`, whose
+        `stagentapp` session agent keeps running either way. Off by default when the
+        DankMaterialShell widget replaces it.
+      '';
+    };
+
+    dmsWidget = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Build a DankMaterialShell bar widget that does what the native tray menu
+          does (status, enable/disable, save logs, blocked events, configuration,
+          version) and adds an on/off switch for the `stagentd` daemon itself. The
+          switch works through a polkit rule, added with this option, that lets
+          active local `wheel` users start and stop `stagentd.service` without a
+          password.
+
+          This only builds the plugin (`dmsWidget.package`); register it with your
+          DMS setup under the id `netskope` and add that id to a bar.
+        '';
+      };
+
+      package = lib.mkOption {
+        type = lib.types.package;
+        readOnly = true;
+        default = pkgs.runCommandLocal "dms-netskope" { } ''
+          cp -r ${../pkgs/dms-netskope} $out
+          chmod -R u+w $out
+          substituteInPlace $out/Netskope.qml --replace-fail @version@ ${cfg.package.version}
+        '';
+        defaultText = lib.literalMD "the plugin directory from `pkgs/dms-netskope`";
+        description = "The DankMaterialShell plugin directory (id `netskope`).";
+      };
     };
 
     trustCA = lib.mkOption {
@@ -480,7 +521,7 @@ in
     # so no rewriting is needed. Deliberately NOT installed into /etc/xdg/autostart:
     # the UI's lifecycle belongs to the stagentui user service below, and an autostart
     # entry would race it for a second instance.
-    ++ lib.optional cfg.enableTray (
+    ++ lib.optional (cfg.enableTray && cfg.trayIcon) (
       pkgs.runCommandLocal "netskope-stagentui-desktop" { } ''
         install -Dm644 ${cfg.package}/opt/netskope/stagent/stagentui.desktop \
           "$out/share/applications/stagentui.desktop"
@@ -1141,8 +1182,31 @@ in
         ];
         Restart = "always";
         RestartSec = 10;
+        # Make `systemctl stop` a reliable off switch. The daemon's own shutdown does
+        # network work that hangs when the network is down, and when it is killed
+        # instead it leaves its steering routes behind. So kill it after 10s and drop
+        # those routes ourselves; each line is a no-op ("-") when already gone.
+        TimeoutStopSec = 10;
+        ExecStopPost = [
+          "-${pkgs.iproute2}/bin/ip rule del fwmark 0x5 table 9"
+          "-${pkgs.iproute2}/bin/ip route flush table 9"
+          "-${pkgs.iproute2}/bin/ip link del sta0"
+        ];
       };
     };
+
+    # The DMS widget's on/off switch: `systemctl start|stop stagentd` from the
+    # session, without a password, for active local wheel users only.
+    security.polkit.extraConfig = lib.mkIf cfg.dmsWidget.enable ''
+      polkit.addRule(function(action, subject) {
+        if (action.id == "org.freedesktop.systemd1.manage-units" &&
+            action.lookup("unit") == "stagentd.service" &&
+            (action.lookup("verb") == "start" || action.lookup("verb") == "stop") &&
+            subject.local && subject.active && subject.isInGroup("wheel")) {
+          return polkit.Result.YES;
+        }
+      });
+    '';
 
     # Per-user tray UI (#4).
     #
@@ -1186,7 +1250,7 @@ in
         };
       };
 
-      stagentui = {
+      stagentui = lib.mkIf cfg.trayIcon {
         description = "Netskope client tray icon";
         wantedBy = lib.optional cfg.autoStart "graphical-session.target";
         partOf = [ "graphical-session.target" ];

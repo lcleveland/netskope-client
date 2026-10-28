@@ -78,6 +78,14 @@ PluginComponent {
             statusProcess.running = true;
     }
 
+    // Every stAgentCli run registers with the daemon as a new session, and each one
+    // makes it reload its whole config and reset the NPA tunnel. So the background
+    // poll checks only the daemon unit, and the client is asked when someone looks.
+    onInteractionActiveChanged: if (interactionActive)
+        refresh()
+    onDaemonUpChanged: if (daemonUp)
+        refresh()
+
     function run(title, command) {
         if (busy)
             return;
@@ -138,13 +146,37 @@ PluginComponent {
         }
     }
 
-    // A poll is three stAgentCli calls, ~2s each, per bar; actions refresh at once.
+    Process {
+        id: daemonProcess
+
+        command: ["systemctl", "is-active", "--quiet", "stagentd.service"]
+        running: false
+
+        onExited: exitCode => {
+            root.daemonUp = exitCode === 0;
+            if (!root.daemonUp) {
+                root.statusText = "";
+                root.paText = "";
+                root.userEmail = "";
+            }
+            root.everChecked = true;
+        }
+    }
+
+    // A full refresh is three stAgentCli calls, ~2s each, per bar: once at load, then
+    // only while the popout is open. Actions refresh at once.
+    Component.onCompleted: refresh()
+
     Timer {
         interval: 30000
         repeat: true
         running: true
-        triggeredOnStart: true
-        onTriggered: root.refresh()
+        onTriggered: {
+            if (root.interactionActive)
+                root.refresh();
+            else if (!statusProcess.running && !daemonProcess.running)
+                daemonProcess.running = true;
+        }
     }
 
     popoutWidth: 460

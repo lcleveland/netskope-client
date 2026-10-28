@@ -876,6 +876,71 @@ in
       '';
     };
 
+    # Directly connected subnets under steering.
+    #
+    # The client's private-range bypass in table 9 sends the RFC1918 blocks to the
+    # uplink's gateway -- `192.168.0.0/16 via 10.2.0.1 dev eth0` -- and marked
+    # traffic never consults main. So any subnet that is on-link through ANOTHER
+    # interface (a USB-Ethernet gadget, a dock's second NIC) is unreachable on the
+    # steered ports while ping and everything else works. Measured on a real host with
+    # a fingerprint reader on usb0 (192.168.63.0/24): ICMP and refused 22/23 answered,
+    # 80/443 timed out, and
+    #
+    #   ip route get 192.168.63.99 mark 5  ->  via 10.2.0.1 dev eth0 table 9
+    #
+    # Fix: copy main's kernel on-link routes into table 9, but only where table 9
+    # does not already send that subnet into sta0 -- what the client steers stays
+    # steered, only its bypass is corrected. Kernel routes are purged from every table
+    # when their link goes, so there is nothing to clean up, and the client rebuilding
+    # table 9 is just another route event to follow.
+    systemd.services.netskope-onlink-bypass = {
+      description = "Keep directly connected subnets reachable under Netskope steering";
+      bindsTo = [ "sys-subsystem-net-devices-sta0.device" ];
+      after = [ "sys-subsystem-net-devices-sta0.device" ];
+      wantedBy = [ "sys-subsystem-net-devices-sta0.device" ];
+      serviceConfig = {
+        Type = "notify";
+        NotifyAccess = "all";
+        Restart = "always";
+        RestartSec = 5;
+      };
+      script = ''
+        set -eu
+        ip=${pkgs.iproute2}/bin/ip
+
+        sync() {
+          "$ip" -o route show table main proto kernel scope link \
+            | while read -r prefix _ dev _; do
+              [ "$dev" != sta0 ] || continue
+              # Where marked traffic to this subnet goes now. Only act on a mismatch,
+              # so our own route events settle instead of re-triggering forever.
+              got="$("$ip" -o route get "''${prefix%/*}" mark 5 2>/dev/null || true)"
+              case "$got" in
+                *" dev sta0 "*) continue ;; # steered on purpose; not ours to bypass
+                *" via "*) ;;
+                *" dev $dev "*) continue ;; # already on-link
+              esac
+              if "$ip" route replace "$prefix" dev "$dev" scope link table 9; then
+                echo "netskope: $prefix on-link via $dev in table 9 (was: $got)" >&2
+              fi
+            done
+        }
+
+        sync
+        ${config.systemd.package}/bin/systemd-notify --ready
+
+        "$ip" monitor route | while :; do
+          rc=0
+          read -r -t 60 _ || rc=$?
+          if [ "$rc" -ne 0 ] && [ "$rc" -le 128 ]; then
+            break
+          fi
+          while read -r -t 2 _; do :; done
+          sync
+        done
+      '';
+    };
+
     # The client rewrites its anchors when the tenant rotates its CA. Rebuild then,
     # rather than only at boot; the mount picks the new contents up in place.
     systemd.paths.netskope-ca-trust = lib.mkIf cfg.trustCA {

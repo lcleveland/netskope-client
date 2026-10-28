@@ -276,6 +276,12 @@ Unsteered ICMP surviving while steered TCP/DNS died is the fingerprint: it is th
 steering it carries `100.65.0.2/16`, and table 9 holds `default dev sta0` plus
 per-destination bypasses for the corporate ranges.
 
+Those bypasses send all of RFC1918 to the uplink's gateway, which strands any subnet
+that is on-link through another interface (USB-Ethernet devices, a dock's second NIC):
+ping works, 80/443 time out. `netskope-onlink-bypass.service` copies main's kernel
+on-link routes into table 9 wherever table 9 isn't already sending that subnet into
+`sta0`.
+
 ### Trusting the tenant CA — without putting it in your config
 
 With steering live the tenant re-signs every HTTPS connection:

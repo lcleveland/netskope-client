@@ -175,6 +175,35 @@ stdenv.mkDerivation {
     patchelf --replace-needed libappindicator3.so.1          libayatana-appindicator3.so.1 "$ui"
   '';
 
+  # Since 143.0, stAgentSvc rejects any IPC client with an executable mapping outside
+  # /opt/netskope/, /lib, /usr/lib, ... ("code injection"), and on NixOS libc lives in
+  # /nix/store. So the IPC clients get their whole library closure, ld.so included,
+  # copied under installDir/lib and are pointed there. Run autoPatchelf by hand first:
+  # the implicit postFixup would otherwise run before its hook.
+  # shortcut: stAgentUI is left on the store (GTK/WebKit closure + dlopen'd modules);
+  # bundle it too if anyone needs the native tray icon against a 143+ daemon.
+  dontAutoPatchelf = true;
+  postFixup = ''
+    autoPatchelf -- "$out"
+    dest="$out/opt/netskope/stagent"
+    run=/opt/netskope/stagent
+    mkdir -p "$dest/lib"
+    for b in stAgentApp stAgentCli nsdiag bwansvc; do
+      [ -e "$dest/$b" ] || continue
+      ${lib.getBin stdenv.cc.libc}/bin/ldd "$dest/$b" \
+        | awk '$2 == "=>" && $3 ~ /^\// {print $3} $1 ~ /^\// {print $1}' \
+        | xargs -r cp -nL -t "$dest/lib"
+    done
+    chmod u+w "$dest"/lib/*
+    for l in "$dest"/lib/*; do
+      case "$l" in */ld-linux*) ;; *) patchelf --set-rpath '$ORIGIN' "$l" ;; esac
+    done
+    for b in stAgentApp stAgentCli nsdiag bwansvc; do
+      [ -e "$dest/$b" ] || continue
+      patchelf --set-interpreter "$run/lib/ld-linux-x86-64.so.2" --set-rpath "$run/lib" "$dest/$b"
+    done
+  '';
+
   passthru = {
     inherit enableTray;
     # The client hard-codes this path; the module materialises it (see issue #7).

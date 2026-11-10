@@ -288,7 +288,10 @@ in
         default = pkgs.runCommandLocal "dms-netskope" { } ''
           cp -r ${../pkgs/dms-netskope} $out
           chmod -R u+w $out
-          substituteInPlace $out/Netskope.qml --replace-fail @version@ ${cfg.package.version}
+          # The tenant-pinned installer, not the package's nominal version, says what is
+          # actually installed (install.sh: APP_VERSION=...).
+          v=$(sed -n 's/^APP_VERSION=//p' ${cfg.package}/opt/netskope/stagent/install.sh)
+          substituteInPlace $out/Netskope.qml --replace-fail @version@ "''${v:-${cfg.package.version}}"
         '';
         defaultText = lib.literalMD "the plugin directory from `pkgs/dms-netskope`";
         description = "The DankMaterialShell plugin directory (id `netskope`).";

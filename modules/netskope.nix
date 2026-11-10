@@ -167,7 +167,10 @@ in
     package = lib.mkOption {
       type = lib.types.package;
       default = pkgs.callPackage ../pkgs/netskope-client.nix {
-        inherit (cfg) enableTray tenant hash;
+        inherit (cfg) tenant hash;
+        # stAgentUI drags ~340 MB of GTK/WebKit into the /opt bundle; ship it only
+        # when its unit runs.
+        enableTray = cfg.enableTray && cfg.trayIcon;
         url = cfg.sourceUrl;
       };
       defaultText = lib.literalExpression "netskope-client (built from tenant/hash/sourceUrl)";
@@ -1342,7 +1345,13 @@ in
           Type = "simple";
           ExecStart = "/opt/netskope/stagent/stAgentUI";
           WorkingDirectory = "/opt/netskope/stagent";
-          UnsetEnvironment = "LD_LIBRARY_PATH";
+          # The 143+ daemon drops IPC peers with code mapped outside /opt/netskope/, so
+          # keep GIO from loading the session's store-resident modules (gvfs, dconf).
+          UnsetEnvironment = [
+            "LD_LIBRARY_PATH"
+            "GIO_EXTRA_MODULES"
+          ];
+          Environment = "GIO_MODULE_DIR=/opt/netskope/stagent/lib/gio-modules";
           Restart = "on-failure";
           RestartSec = 5;
         };

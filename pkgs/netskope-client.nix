@@ -179,16 +179,17 @@ stdenv.mkDerivation {
   # /opt/netskope/, /lib, /usr/lib, ... ("code injection"), and on NixOS libc lives in
   # /nix/store. So the IPC clients get their whole library closure, ld.so included,
   # copied under installDir/lib and are pointed there. Run autoPatchelf by hand first:
-  # the implicit postFixup would otherwise run before its hook.
-  # shortcut: stAgentUI is left on the store (GTK/WebKit closure + dlopen'd modules);
-  # bundle it too if anyone needs the native tray icon against a 143+ daemon.
+  # the implicit postFixup would otherwise run before its hook. Some nixpkgs libs
+  # (libsoup, webkit) NEED sqlite by absolute store path, which bypasses rpath, so
+  # those entries are cut to the basename. Runtime-loaded GIO modules are handled by
+  # the stagentui unit's environment.
   dontAutoPatchelf = true;
   postFixup = ''
     autoPatchelf -- "$out"
     dest="$out/opt/netskope/stagent"
     run=/opt/netskope/stagent
     mkdir -p "$dest/lib"
-    for b in stAgentApp stAgentCli nsdiag bwansvc; do
+    for b in stAgentApp stAgentCli stAgentUI nsdiag bwansvc; do
       [ -e "$dest/$b" ] || continue
       ${lib.getBin stdenv.cc.libc}/bin/ldd "$dest/$b" \
         | awk '$2 == "=>" && $3 ~ /^\// {print $3} $1 ~ /^\// {print $1}' \
@@ -196,9 +197,13 @@ stdenv.mkDerivation {
     done
     chmod u+w "$dest"/lib/*
     for l in "$dest"/lib/*; do
-      case "$l" in */ld-linux*) ;; *) patchelf --set-rpath '$ORIGIN' "$l" ;; esac
+      case "$l" in */ld-linux*) continue ;; esac
+      patchelf --set-rpath '$ORIGIN' "$l"
+      for n in $(patchelf --print-needed "$l" | grep '^/'); do
+        patchelf --replace-needed "$n" "$(basename "$n")" "$l"
+      done
     done
-    for b in stAgentApp stAgentCli nsdiag bwansvc; do
+    for b in stAgentApp stAgentCli stAgentUI nsdiag bwansvc; do
       [ -e "$dest/$b" ] || continue
       patchelf --set-interpreter "$run/lib/ld-linux-x86-64.so.2" --set-rpath "$run/lib" "$dest/$b"
     done
